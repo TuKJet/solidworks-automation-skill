@@ -77,6 +77,21 @@ def test_http_host_auth_image_and_binary_resource_roundtrip(tmp_path):
                             picture = next(item for item in preview.content if item.type == "image")
                             assert picture.mimeType == "image/png"
                             assert Image.open(io.BytesIO(base64.b64decode(picture.data))).size == (16, 16)
+                            binary = bytearray()
+                            offset = 0
+                            while True:
+                                chunk = await session.call_tool("cadstudio_read_artifact", {"params": {
+                                    "artifact_id": refs[1]["artifact_id"], "as_preview": False,
+                                    "offset": offset, "max_bytes": 7,
+                                }})
+                                assert not chunk.isError
+                                data = json.loads(next(item.text for item in chunk.content if item.type == "text"))
+                                assert data["status"] == "ok"
+                                binary.extend(base64.b64decode(data["data"]))
+                                if data["next_offset"] is None:
+                                    break
+                                offset = data["next_offset"]
+                            assert hashlib.sha256(binary).hexdigest() == refs[1]["sha256"]
                             resource = await session.read_resource(refs[1]["uri"])
                             restored = base64.b64decode(resource.contents[0].blob)
                             assert hashlib.sha256(restored).hexdigest() == refs[1]["sha256"]

@@ -17,11 +17,13 @@ pythoncom, _win32com, VARIANT = import_com_dependencies()
 
 
 PAPER_SIZES = {
-    "A4": {"code": 5, "width_m": 0.297, "height_m": 0.210},
-    "A3": {"code": 6, "width_m": 0.420, "height_m": 0.297},
-    "A2": {"code": 7, "width_m": 0.594, "height_m": 0.420},
-    "A1": {"code": 8, "width_m": 0.841, "height_m": 0.594},
-    "A0": {"code": 9, "width_m": 1.189, "height_m": 0.841},
+    # swDwgPaperSizes: A4 横向=6, A4 纵向=7, A3=8, A2=9, A1=10, A0=11.
+    # 纸张方向最终以 ISheet 回读为准；这里保留默认横向尺寸供无 COM 回退。
+    "A4": {"code": 6, "width_m": 0.297, "height_m": 0.210},
+    "A3": {"code": 8, "width_m": 0.420, "height_m": 0.297},
+    "A2": {"code": 9, "width_m": 0.594, "height_m": 0.420},
+    "A1": {"code": 10, "width_m": 0.841, "height_m": 0.594},
+    "A0": {"code": 11, "width_m": 1.189, "height_m": 0.841},
 }
 
 STANDARD_DRAWING_SCALES = (10.0, 5.0, 2.0, 1.0, 0.5, 0.2, 0.1, 0.05, 0.02, 0.01)
@@ -65,6 +67,48 @@ def _as_sequence(value):
     if isinstance(value, (list, tuple)):
         return list(value)
     return [value]
+
+
+def _sheet_dimensions(sheet):
+    """@brief 从当前图纸页回读实际宽高（米），并标记证据来源。
+
+    ``ISheet::GetProperties2``/``GetProperties`` 返回的属性数组中，SolidWorks
+    将图纸宽度和高度放在索引 5、6。不同版本或 mock 可能只暴露 ``GetSize``，
+    因此保留一个形状明确的兼容回退；读不到有效正数时返回 ``None``，由调用方
+    使用纸张枚举的保守尺寸。
+    """
+    for method_name in ("GetProperties2", "GetProperties"):
+        values = _as_sequence(_safe_member(sheet, method_name, default=[]))
+        if len(values) <= 6:
+            continue
+        try:
+            width_m, height_m = float(values[5]), float(values[6])
+        except (TypeError, ValueError):
+            continue
+        if not all(math.isfinite(item) and item > 0 for item in (width_m, height_m)):
+            continue
+        return {
+            "width_m": width_m,
+            "height_m": height_m,
+            "orientation": "portrait" if height_m > width_m else "landscape",
+            "source": method_name,
+        }
+
+    size = _as_sequence(_safe_member(sheet, "GetSize", default=[]))
+    if len(size) in (2, 3):
+        try:
+            # Generated COM wrappers may return (paper_enum, width, height).
+            width_m, height_m = float(size[-2]), float(size[-1])
+        except (TypeError, ValueError):
+            width_m = height_m = 0.0
+        if all(math.isfinite(item) and item > 0 for item in (width_m, height_m)):
+            return {
+                "width_m": width_m,
+                "height_m": height_m,
+                "orientation": "portrait" if height_m > width_m else "landscape",
+                "source": "GetSize",
+            }
+    return None
 
 
 def _normalise_box(value):
@@ -388,6 +432,7 @@ def plan_standard_view_layout(
     paper_size="A3",
     projection="third_angle",
     requested_scale=None,
+    sheet_dimensions_m=None,
     margin_m=0.012,
     gap_m=0.018,
     title_block_width_m=0.180,
@@ -408,8 +453,25 @@ def plan_standard_view_layout(
     if min(width, height, depth) <= 0 or not all(math.isfinite(item) for item in (width, height, depth)):
         raise ValueError("模型外形尺寸必须为有限正数")
 
-    sheet_width = spec["width_m"]
-    sheet_height = spec["height_m"]
+    if sheet_dimensions_m is None:
+        sheet_width, sheet_height = spec["width_m"], spec["height_m"]
+        sheet_size_source = "paper_size_fallback"
+    elif isinstance(sheet_dimensions_m, dict):
+        sheet_width = sheet_dimensions_m.get("width_m")
+        sheet_height = sheet_dimensions_m.get("height_m")
+        sheet_size_source = sheet_dimensions_m.get("source", "actual")
+    else:
+        try:
+            sheet_width, sheet_height = sheet_dimensions_m
+        except (TypeError, ValueError) as exc:
+            raise ValueError("sheet_dimensions_m 必须包含宽度和高度") from exc
+        sheet_size_source = "actual"
+    try:
+        sheet_width, sheet_height = float(sheet_width), float(sheet_height)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("sheet_dimensions_m 必须包含有效宽高") from exc
+    if not all(math.isfinite(item) and item > 0 for item in (sheet_width, sheet_height)):
+        raise ValueError("sheet_dimensions_m 必须包含有限正数宽高")
     working_left = margin_m
     working_bottom = margin_m + title_block_height_m + gap_m
     working_right = sheet_width - margin_m
@@ -425,6 +487,7 @@ def plan_standard_view_layout(
             "status": "blocked",
             "paper_size": paper_size,
             "sheet": {"width_m": sheet_width, "height_m": sheet_height},
+            "sheet_size_source": sheet_size_source,
             "views": [],
             "manual_review_required": True,
             "retryable": True,
@@ -510,6 +573,7 @@ def plan_standard_view_layout(
         "projection": projection,
         "gap_m": gap_m,
         "sheet": {"width_m": sheet_width, "height_m": sheet_height},
+        "sheet_size_source": sheet_size_source,
         "working_area": {"left": working_left, "bottom": working_bottom, "right": working_right, "top": working_top},
         "title_block_box": title_box,
         "scale": scale,
@@ -1176,14 +1240,13 @@ def set_sheet_format(drawing_model, format_path):
     return sheet.SetTemplateName(format_path)
 
 
-def add_sheet(drawing_model, paper_size=7, template_path="", first_angle=True):
+def add_sheet(drawing_model, paper_size=PAPER_SIZES["A2"]["code"], template_path="", first_angle=True):
     """
     添加新图纸
 
     参数:
         paper_size: 纸张大小
-            0=A, 1=B, 2=C, 3=D, 4=E,
-            5=A4, 6=A3, 7=A2, 8=A1, 9=A0
+            默认 A2；6=A4 横向, 7=A4 纵向, 8=A3, 9=A2, 10=A1, 11=A0
         template_path: 图纸格式模板路径
     """
     return drawing_model.NewSheet4(
@@ -1573,14 +1636,27 @@ def inspect_drawing_structure(drawing_model, *, paper_size_hint=None, title_bloc
                 tables.append(_table_evidence(table, sheet_name))
     current_sheet = _safe_member(drawing_model, "GetCurrentSheet")
     template = _safe_member(current_sheet, "GetTemplateName", default="")
+    actual_sheet_size = _sheet_dimensions(current_sheet)
     paper_size = str(paper_size_hint or _paper_size_from_template(template) or "").upper() or None
     spec = PAPER_SIZES.get(paper_size)
+    if actual_sheet_size is not None:
+        sheet_size = {
+            "width_m": actual_sheet_size["width_m"],
+            "height_m": actual_sheet_size["height_m"],
+        }
+        sheet_size_source = actual_sheet_size["source"]
+    elif spec is not None:
+        sheet_size = {"width_m": spec["width_m"], "height_m": spec["height_m"]}
+        sheet_size_source = "paper_size_fallback"
+    else:
+        sheet_size = None
+        sheet_size_source = "unavailable"
     inferred_title_box = title_block_box
-    if inferred_title_box is None and spec is not None:
+    if inferred_title_box is None and sheet_size is not None:
         inferred_title_box = {
-            "left": spec["width_m"] - 0.012 - 0.180,
+            "left": sheet_size["width_m"] - 0.012 - 0.180,
             "bottom": 0.012,
-            "right": spec["width_m"] - 0.012,
+            "right": sheet_size["width_m"] - 0.012,
             "top": 0.067,
         }
     compact_template_name = re.sub(r"[^a-z0-9\u4e00-\u9fff]", "", Path(str(template or "")).stem.casefold())
@@ -1606,7 +1682,8 @@ def inspect_drawing_structure(drawing_model, *, paper_size_hint=None, title_bloc
         "professional_annotations": professional_annotations,
         "template_path": str(template or ""),
         "paper_size": paper_size,
-        "sheet_size": {"width_m": spec["width_m"], "height_m": spec["height_m"]} if spec else None,
+        "sheet_size": sheet_size,
+        "sheet_size_source": sheet_size_source,
         "title_block": {
             "candidate": bool(template),
             "gbt_candidate": gbt_candidate,
@@ -1770,6 +1847,9 @@ def export_sheet_to_pdf(model, output_path, sheet_names=None, sw_app=None):
         sw_app: 可选的 SldWorks.Application 对象；传入会话对象可避免 SW2024
             动态 IModelDoc2 未暴露 GetSldWorksObject 的兼容性问题。
     """
+    output = Path(output_path).expanduser().resolve()
+    output.parent.mkdir(parents=True, exist_ok=True)
+    before = (output.stat().st_mtime_ns, output.stat().st_size) if output.is_file() else None
     sw = sw_app
     if sw is None:
         for prog_id in ("SldWorks.Application.32", "SldWorks.Application"):
@@ -1790,19 +1870,38 @@ def export_sheet_to_pdf(model, output_path, sheet_names=None, sw_app=None):
         sheet_names = get_com_member(drawing, "GetSheetNames")
 
     try:
-        pdf_data.SetSheets(0, sheet_names)  # 0 = swExportData_ExportSpecifiedSheets
-    except Exception:
+        names = tuple(str(name) for name in _as_sequence(sheet_names))
+        if not names:
+            return False
+        sheets = VARIANT(pythoncom.VT_ARRAY | pythoncom.VT_BSTR, names)
+        # swExportDataSheetsToExport_e: All=1, Current=2, Specified=3.
+        if not pdf_data.SetSheets(3, sheets):
+            return False
+    except Exception as exc:
+        print(f"PDF 图纸选择失败: {exc}")
         return False
 
     errors = VARIANT(pythoncom.VT_BYREF | pythoncom.VT_I4, 0)
     warnings = VARIANT(pythoncom.VT_BYREF | pythoncom.VT_I4, 0)
-    success = model.Extension.SaveAs(output_path, 0, 1, pdf_data, errors, warnings)
-
-    if success:
-        print(f"PDF 导出成功: {output_path}")
-    else:
-        print(f"PDF 导出失败, 错误码: {errors.value}")
-    return success
+    success = model.Extension.SaveAs(str(output), 0, 1, pdf_data, errors, warnings)
+    if not success or int(errors.value):
+        print(f"PDF 导出失败, 错误码: {errors.value}, 警告码: {warnings.value}")
+        return False
+    if not output.is_file() or output.stat().st_size <= 0:
+        return False
+    after = (output.stat().st_mtime_ns, output.stat().st_size)
+    if before is not None and after == before:
+        return False
+    try:
+        import fitz
+        with fitz.open(str(output)) as document:
+            if document.page_count == 0:
+                return False
+    except Exception as exc:
+        print(f"PDF 输出验证失败: {exc}")
+        return False
+    print(f"PDF 导出成功: {output}")
+    return True
 
 
 def setup_current_sheet(drawing_model, template_candidates, *, paper_size="A3", projection="first_angle", require_gbt=True) -> dict:
@@ -1844,6 +1943,9 @@ def setup_current_sheet(drawing_model, template_candidates, *, paper_size="A3", 
         ))
     except Exception as exc:
         return {**selection, "status": "failed", "stage": "create", "configured": False, "projection": projection, "error_code": "DRAWING_SHEET_SETUP_FAILED", "error": str(exc)}
+    if configured:
+        _safe_member(drawing_model, "ForceRebuild3", False)
+    sheet_size = _sheet_dimensions(_safe_member(drawing_model, "GetCurrentSheet")) if configured else None
     return {
         **selection,
         "status": "pass" if configured else "failed",
@@ -1852,6 +1954,8 @@ def setup_current_sheet(drawing_model, template_candidates, *, paper_size="A3", 
         "paper_size": paper_size,
         "projection": projection,
         "sheet_name": sheet_name,
+        "sheet_size": sheet_size,
+        "sheet_size_source": sheet_size.get("source") if sheet_size else "paper_size_fallback",
         "error_code": None if configured else "DRAWING_SHEET_SETUP_FAILED",
         "manual_review_required": True,
     }
@@ -1964,6 +2068,7 @@ def generate_drawing_from_spec(drawing_model, spec, source_model_path, template_
         paper_size=paper_size,
         projection=projection,
         requested_scale=spec.get("scale"),
+        sheet_dimensions_m=sheet_setup.get("sheet_size"),
     )
     if layout.get("status") != "pass":
         return {"status": "blocked", "stage": "layout", "sheetSetup": sheet_setup, "layout": layout, "error_code": layout.get("error_code"), "manual_review_required": True}

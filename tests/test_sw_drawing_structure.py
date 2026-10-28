@@ -877,7 +877,7 @@ def test_setup_current_sheet_as_a3_uses_verified_signature(tmp_path):
     result = setup_current_sheet_as_a3(drawing, [template])
 
     assert result["status"] == "pass"
-    assert drawing.args[:7] == ("Sheet1", 6, 12, 1.0, 1.0, True, str(template.resolve()))
+    assert drawing.args[:7] == ("Sheet1", 8, 12, 1.0, 1.0, True, str(template.resolve()))
     assert len(drawing.args) == 17
 
 

@@ -147,7 +147,7 @@ def _load_automation_modules() -> None:
         "validate_hole_positions": review.validate_hole_positions,
         "drawing_generate_from_spec": drawing.generate_drawing_from_spec,
         "drawing_export_sheet_to_pdf": drawing.export_sheet_to_pdf,
-        "drawing_save_review_previews": review.save_review_previews,
+        "drawing_save_review_previews": review.save_drawing_review_previews,
         "drawing_inspect_bmp_preview": review.inspect_bmp_preview,
         "drawing_inspect_structure": drawing.inspect_drawing_structure,
         "drawing_review_artifacts": drawing_review.review_drawing_artifacts,
@@ -3257,7 +3257,8 @@ def solidworks_generate_drawing(params: SolidWorksGenerateDrawingInput) -> str:
             output_dir / "previews",
             basename=drawing_path.stem,
             views=("front", "top", "right"),
-        )
+            pdf_path=pdf_path,
+        ) if pdf_ok else []
         preview_evidence = [drawing_inspect_bmp_preview(path) for path in previews]
         geometry_evidence = collect_geometry_measurements(source_model) if spec.get("holeRequirements") else None
         review = drawing_review_artifacts(
@@ -3273,7 +3274,7 @@ def solidworks_generate_drawing(params: SolidWorksGenerateDrawingInput) -> str:
             "sourceModel": str(source_path),
             "outputs": {
                 "slddrw": {"path": str(drawing_path), "exists": drawing_path.is_file(), "size_bytes": drawing_path.stat().st_size if drawing_path.is_file() else 0},
-                "pdf": {"path": str(pdf_path), "exists": pdf_path.is_file(), "size_bytes": pdf_path.stat().st_size if pdf_path.is_file() else 0},
+                "pdf": {"path": str(pdf_path) if pdf_ok else None, "exists": bool(pdf_ok), "size_bytes": pdf_path.stat().st_size if pdf_ok else 0, "export_succeeded": bool(pdf_ok)},
                 "previews": preview_evidence,
             },
             "generation": generation,
@@ -3311,6 +3312,7 @@ def solidworks_review_drawing(params: SolidWorksReviewDrawingInput) -> str:
             output_dir / "previews",
             basename=params.basename,
             views=("front", "top", "right"),
+            pdf_path=params.pdf_path,
         )
         preview_evidence = [drawing_inspect_bmp_preview(path) for path in previews]
         review = drawing_review_artifacts(
@@ -3346,13 +3348,18 @@ def solidworks_inspect_drawing(params: SolidWorksInspectDrawingInput) -> str:
         sw, _active = connect_solidworks(wait_seconds=1, visible=True)
         drawing_model = open_document(sw, params.drawing_path, read_only=True, silent=True, raise_on_error=True)
         structure = drawing_inspect_structure(drawing_model, paper_size_hint=params.paper_size_hint)
+        preview_pdf = output_dir / f"{params.basename}.pdf"
+        pdf_ok = drawing_export_sheet_to_pdf(drawing_model, str(preview_pdf), sw_app=sw)
         previews = drawing_save_review_previews(
             drawing_model,
             output_dir / "previews",
             basename=params.basename,
             views=("front", "top", "right"),
-        )
-        payload = {"status": structure.get("status"), "drawingPath": str(Path(params.drawing_path).resolve()), "structure": structure, "previews": [drawing_inspect_bmp_preview(path) for path in previews], "manual_review_required": True}
+            pdf_path=preview_pdf,
+        ) if pdf_ok else []
+        payload = {"status": structure.get("status") if pdf_ok else "blocked", "drawingPath": str(Path(params.drawing_path).resolve()), "structure": structure, "previews": [drawing_inspect_bmp_preview(path) for path in previews], "outputs": {"pdf": {"path": str(preview_pdf) if pdf_ok else None, "exists": bool(pdf_ok), "export_succeeded": bool(pdf_ok)}}, "pdf_export_succeeded": bool(pdf_ok), "manual_review_required": True}
+        if not pdf_ok:
+            payload["error_code"] = "DRAWING_FINAL_PDF_REQUIRED"
         report_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
         payload["reportPath"] = str(report_path)
         return payload
@@ -3594,10 +3601,12 @@ def cadstudio_read_artifact(params: ArtifactReadInput):
             if len(encoded) > MAX_INLINE:
                 raise ValueError("转换后的 PNG 超过内联大小上限，请取回原始文件块")
             return Image(data=encoded, format="png")
+        # ArtifactReadInput intentionally has no response_format field: artifact
+        # chunks are always JSON so callers can reliably consume the base64 data.
         return _result({"status": "ok", **metadata, "encoding": "base64",
-            "data": base64.b64encode(data).decode("ascii")}, params.response_format)
+            "data": base64.b64encode(data).decode("ascii")}, ResponseFormat.JSON)
     except Exception as error:
-        return _tool_error(error, params.response_format)
+        return _tool_error(error, ResponseFormat.JSON)
 
 
 @mcp.resource("cad-artifact://delivery/{artifact_id}", mime_type="application/octet-stream")

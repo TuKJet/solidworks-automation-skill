@@ -474,6 +474,29 @@ def inspect_bmp_preview(path, sample_limit=200000):
     if not info["exists"] or info["size_bytes"] <= 0:
         return info
 
+    if Path(path).suffix.lower() == ".png":
+        # PDF-rendered drawing evidence is independent of the desktop viewport.
+        try:
+            fitz = _import_pdf_parser()
+            pix = fitz.Pixmap(str(path))
+            if pix.n != 3:
+                pix = fitz.Pixmap(fitz.csRGB, pix)
+            info.update(width=pix.width, height=pix.height)
+            pixels = pix.samples
+            samples = []
+            for gy in range(min(pix.height, 96)):
+                y = gy * max(pix.height - 1, 1) // max(min(pix.height, 96) - 1, 1)
+                for gx in range(min(pix.width, 96)):
+                    x = gx * max(pix.width - 1, 1) // max(min(pix.width, 96) - 1, 1)
+                    offset = y * pix.stride + x * pix.n
+                    samples.append(tuple(pixels[offset:offset + 3]))
+            dark = sum(.299 * r + .587 * g + .114 * b < 245 for r, g, b in samples)
+            info.update(unique_sample_values=len(set(samples)), dark_pixel_ratio=dark / len(samples) if samples else 0.0)
+            info["likely_blank"] = info["dark_pixel_ratio"] < .0005
+        except Exception as exc:
+            info["error"] = str(exc)
+        return info
+
     width, height = _read_bmp_size(path)
     info["width"] = width
     info["height"] = height
@@ -629,6 +652,36 @@ def save_review_previews(model, output_dir, basename="review", views=None):
         save_preview(model, output_dir / f"{basename}_{view}.bmp", view)
         for view in views
     ]
+
+
+def save_drawing_review_previews(model, output_dir, basename="review", views=None, pdf_path=None):
+    """Render the delivered PDF sheets rather than applying 3D camera views to a drawing."""
+    if pdf_path is None:
+        # Keep a diagnostic viewport image when no final PDF is available. Never
+        # disguise a blank viewport as validated final drawing evidence.
+        output_dir = _expand_path(output_dir)
+        output_dir.mkdir(parents=True, exist_ok=True)
+        path = output_dir / f"{basename}_sheet.bmp"
+        activate_model_for_preview(model)
+        clear_selection_for_preview(model)
+        zoom_to_fit(model)
+        if not model.SaveBMP(str(path), 1600, 1000) or not path.is_file():
+            raise RuntimeError(f"工程图预览导出失败: {path}")
+        return [str(path)]
+    fitz = _import_pdf_parser()
+    output_dir = _expand_path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    paths = []
+    with fitz.open(str(pdf_path)) as document:
+        if document.page_count == 0:
+            raise ValueError("工程图 PDF 不含页面")
+        for index, page in enumerate(document):
+            path = output_dir / f"{basename}_sheet_{index + 1}.png"
+            scale = min(2.0, 2400.0 / max(page.rect.width, page.rect.height))
+            pixmap = page.get_pixmap(matrix=fitz.Matrix(scale, scale), colorspace=fitz.csRGB, alpha=False)
+            pixmap.save(str(path))
+            paths.append(str(path))
+    return paths
 
 
 def _feature_health(feature):

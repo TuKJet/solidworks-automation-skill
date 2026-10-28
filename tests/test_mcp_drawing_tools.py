@@ -43,3 +43,49 @@ def test_drawing_spec_validation_can_be_used_without_loading_com(tmp_path: Path)
     result = validate_drawing_spec(str(source))
 
     assert result["status"] == "blocked"
+
+
+@pytest.mark.parametrize("pdf_ok", [False, True])
+def test_inspect_drawing_requires_fresh_pdf(monkeypatch, tmp_path: Path, pdf_ok):
+    (tmp_path / "model.slddrw").touch()
+    monkeypatch.setattr(server, "_run_locked", lambda op, _format: op())
+    monkeypatch.setattr(server, "connect_solidworks", lambda **kw: (object(), None), raising=False)
+    monkeypatch.setattr(server, "open_document", lambda *a, **kw: object(), raising=False)
+    monkeypatch.setattr(server, "drawing_inspect_structure", lambda *a, **kw: {"status": "pass"}, raising=False)
+    monkeypatch.setattr(server, "drawing_export_sheet_to_pdf", lambda *a, **kw: pdf_ok, raising=False)
+    def previews(*args, **kwargs):
+        assert pdf_ok, "PDF failure must not invoke desktop viewport fallback"
+        return []
+    monkeypatch.setattr(server, "drawing_save_review_previews", previews, raising=False)
+    result = server.solidworks_inspect_drawing(server.SolidWorksInspectDrawingInput(
+        drawing_path=str(tmp_path / "model.slddrw"), output_dir=str(tmp_path), basename="inspect"))
+    assert result["status"] == ("pass" if pdf_ok else "blocked")
+    assert result["pdf_export_succeeded"] is pdf_ok
+    assert bool(result["outputs"]["pdf"]["path"]) is pdf_ok
+
+
+def test_failed_overwrite_does_not_publish_stale_pdf(monkeypatch, tmp_path: Path):
+    source = tmp_path / "source.sldprt"
+    source.touch()
+    (tmp_path / "block.pdf").write_bytes(b"old pdf")
+    spec = {"sourceModel": str(source)}
+    (tmp_path / "spec.json").write_text(json.dumps(spec), encoding="utf-8")
+    monkeypatch.setattr(server, "_run_locked", lambda op, _format: op())
+    for name, fn in {
+        "drawing_validate_spec": lambda *a: {"spec": spec},
+        "connect_solidworks": lambda **kw: (object(), None),
+        "open_document": lambda *a, **kw: object(),
+        "new_document": lambda *a: object(),
+        "drawing_generate_from_spec": lambda *a, **kw: {"status": "pass", "structure": {}},
+        "save_document": lambda *a: True,
+        "drawing_export_sheet_to_pdf": lambda *a, **kw: False,
+        "drawing_save_review_previews": lambda *a, **kw: [],
+        "drawing_review_artifacts": lambda *a, **kw: {"status": "blocked"},
+    }.items():
+        monkeypatch.setattr(server, name, fn, raising=False)
+    result = server.solidworks_generate_drawing(server.SolidWorksGenerateDrawingInput(
+        spec_path=str(tmp_path / "spec.json"), output_dir=str(tmp_path),
+        drawing_filename="block.slddrw", overwrite=True))
+    assert result["outputs"]["pdf"] == {
+        "path": None, "exists": False, "size_bytes": 0, "export_succeeded": False}
+    assert (tmp_path / "block.pdf").read_bytes() == b"old pdf"
