@@ -1133,13 +1133,7 @@ def build_review_report(model, output_dir, basename="review", views=None, expect
     interference = None
     drawing_structure = None
     drawing_layout = None
-    if summary.get("type") == 2:
-        try:
-            from .sw_assembly import get_interference_detection
-        except ImportError:
-            from sw_assembly import get_interference_detection
-        interference = get_interference_detection(model)
-    elif summary.get("type") == 3:
+    if summary.get("type") == 3:
         try:
             from .sw_drawing import inspect_drawing_structure
         except ImportError:
@@ -1147,12 +1141,7 @@ def build_review_report(model, output_dir, basename="review", views=None, expect
         drawing_structure = inspect_drawing_structure(model)
         drawing_layout = review_drawing_layout(drawing_structure)
     sketch_quality = None
-    if summary.get("type") == 1:
-        try:
-            from .sw_sketch_quality import inspect_model_sketches
-        except ImportError:
-            from sw_sketch_quality import inspect_model_sketches
-        sketch_quality = inspect_model_sketches(model)
+    # Modelling quality/interference modules are outside this drawing package.
 
     checks = {
         "rebuild_succeeded": rebuild_ok,

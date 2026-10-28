@@ -1,3 +1,0 @@
-LIBRARY "CadStudio.NativeHoldLineBridge"
-EXPORTS
-    RunPreparedHoldLine

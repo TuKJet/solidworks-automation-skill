@@ -1,8 +1,6 @@
 interface:
-  display_name: "SolidWorks Automation"
-  short_description: "Automate SolidWorks CAD with Python COM"
-  default_prompt: "Use $solidworks-automation to create, edit, export, or troubleshoot SolidWorks CAD models with Python automation."
-
+  display_name: "SolidWorks 3D 转 2D"
+  short_description: "独立生成 SolidWorks 二维工程图草稿，支持批量出图、审查和版本更新"
+  default_prompt: "使用 $solidworks-3d-2d 将我的 SolidWorks 工程转为二维标注图，并汇报需要复核的项目。"
 policy:
   allow_implicit_invocation: true
-

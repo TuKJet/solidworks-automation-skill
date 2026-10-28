@@ -231,12 +231,8 @@ class SolidWorksSession:
                 is_current_model = get_com_member(self.model, "GetTitle") == title
             except Exception:
                 is_current_model = True
-        if model is not None:
-            try:
-                from .sw_part import clear_sketch_selection_cache
-            except ImportError:
-                from sw_part import clear_sketch_selection_cache
-            clear_sketch_selection_cache(model)
+        # This standalone package only reads models and creates drawings; it
+        # does not own or populate the modelling package's sketch cache.
         self.sw.CloseDoc(title)
         self._owned_documents = [item for item in self._owned_documents if item is not model]
         if is_current_model:

@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 
-from apps.desktop.cad_workbench.artifact_ledger import RunLedger, sha256_file
+from scripts.artifact_ledger import RunLedger, sha256_file
 from scripts.sw_project_batch import run_batch
 
 

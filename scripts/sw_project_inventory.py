@@ -7,7 +7,7 @@ CAD_EXTENSIONS = {".sldprt", ".sldasm", ".slddrw", ".step", ".stp", ".iges", ".i
 EXCLUDED_NAMES = {"agent", "output", "outputs", ".git", "__pycache__"}
 
 def _is_link(path: Path) -> bool:
-    return path.is_symlink() or bool(getattr(path.lstat(), 'st_file_attributes', 0) & stat.FILE_ATTRIBUTE_REPARSE_POINT)
+    return path.is_symlink() or bool(getattr(path.lstat(), 'st_file_attributes', 0) & getattr(stat, 'FILE_ATTRIBUTE_REPARSE_POINT', 0x400))
 
 def _sha256(path: Path) -> str:
     h = hashlib.sha256()

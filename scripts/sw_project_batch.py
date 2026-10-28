@@ -6,7 +6,7 @@ import hashlib
 from pathlib import Path
 from typing import Any, Callable
 
-from apps.desktop.cad_workbench.artifact_ledger import RunLedger, sha256_file
+from scripts.artifact_ledger import RunLedger, sha256_file
 
 
 def _outputs(value: Any) -> list[Path]:
