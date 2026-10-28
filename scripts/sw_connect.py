@@ -556,13 +556,13 @@ def open_document(sw, file_path, read_only=False, silent=False, raise_on_error=F
         existing_model = sw.GetOpenDocumentByName(file_path)
     except Exception:
         existing_model = None
-    if existing_model is not None:
-        print(f"已复用打开文档: {file_path}")
-        return existing_model
-
     ext = os.path.splitext(file_path)[1].lower()
     foreign_exts = {".step", ".stp", ".igs", ".iges"}
     type_map = {".sldprt": 1, ".sldasm": 2, ".slddrw": 3}
+    if existing_model is not None:
+        existing_model = activate_document_verified(sw, existing_model, file_path, expected_type=type_map.get(ext))
+        print(f"已复用打开文档: {file_path}")
+        return existing_model
 
     errors = VARIANT(pythoncom.VT_BYREF | pythoncom.VT_I4, 0)
     warnings = VARIANT(pythoncom.VT_BYREF | pythoncom.VT_I4, 0)
@@ -617,6 +617,8 @@ def open_document(sw, file_path, read_only=False, silent=False, raise_on_error=F
             if len(values) > 2 and values[2] is not None:
                 warnings.value = int(values[2])
     if model:
+        if ext in type_map:
+            model = activate_document_verified(sw, model, file_path, expected_type=type_map[ext])
         print(f"已打开: {file_path}")
     else:
         message = f"打开失败, 错误码: {errors.value} ({classify_sw_file_load_errors(errors.value)}), 警告码: {warnings.value} ({classify_sw_file_load_warnings(warnings.value)})"
@@ -624,6 +626,44 @@ def open_document(sw, file_path, read_only=False, silent=False, raise_on_error=F
             raise SolidWorksDocumentOpenError(message, errors.value, warnings.value)
         print(message)
     return model
+
+
+def activate_document_verified(sw, model, source_path, *, expected_type=None):
+    """激活文档并核实完整路径及 SolidWorks 文档类型。"""
+    source = Path(source_path).expanduser().resolve()
+    title = str(get_com_member(model, "GetTitle") or "")
+    if not title:
+        raise RuntimeError("源文档没有可激活的标题")
+    errors = VARIANT(pythoncom.VT_BYREF | pythoncom.VT_I4, 0)
+    try:
+        active = sw.ActivateDoc3(title, False, 0, errors)
+    except TypeError:
+        ole_object = getattr(sw, "_oleobj_", None)
+        if ole_object is None:
+            raise
+        active = win32com_client.dynamic.DumbDispatch(ole_object, "SldWorks.Application").ActivateDoc3(title, False, 0, errors)
+    except Exception:
+        try:
+            sw.ActivateDoc2(title, False, errors)
+        except TypeError:
+            ole_object = getattr(sw, "_oleobj_", None)
+            if ole_object is None:
+                raise
+            win32com_client.dynamic.DumbDispatch(ole_object, "SldWorks.Application").ActivateDoc2(title, False, errors)
+        active = get_com_member(sw, "ActiveDoc")
+    reported_active = get_com_member(sw, "ActiveDoc", default=None)
+    if reported_active is None:
+        raise RuntimeError(f"SolidWorks 激活后无法读取 ActiveDoc: {source}")
+    active = reported_active
+    active_path = str(get_com_member(active, "GetPathName") or "")
+    if not active_path or Path(active_path).expanduser().resolve() != source:
+        raise RuntimeError(f"活动文档与源路径不一致: active={active_path}, source={source}")
+    actual_type = get_com_member(active, "GetType", default=None)
+    if actual_type is None:
+        raise RuntimeError(f"活动文档类型读取失败: source={source}")
+    if expected_type is not None and int(actual_type) != int(expected_type):
+        raise RuntimeError(f"活动文档类型不一致: active={actual_type}, expected={expected_type}, source={source}")
+    return active
 
 
 def save_document(model, file_path=None):
@@ -640,6 +680,12 @@ def save_document(model, file_path=None):
     errors = VARIANT(pythoncom.VT_BYREF | pythoncom.VT_I4, 0)
     warnings = VARIANT(pythoncom.VT_BYREF | pythoncom.VT_I4, 0)
 
+    target_path = _expand_path(file_path) if file_path else str(get_com_member(model, "GetPathName") or "")
+    before = None
+    if target_path and os.path.isfile(target_path):
+        stat = os.stat(target_path)
+        import hashlib
+        before = (stat.st_size, stat.st_mtime_ns, hashlib.sha256(Path(target_path).read_bytes()).hexdigest())
     if file_path:
         file_path = _expand_path(file_path)
         _ensure_parent_dir(file_path)
@@ -650,6 +696,15 @@ def save_document(model, file_path=None):
         success = model.Save3(1, errors, warnings)
 
     if success:
+        if not target_path or not os.path.isfile(target_path) or os.path.getsize(target_path) <= 0:
+            print(f"保存后文件证据缺失: {target_path}")
+            return False
+        stat = os.stat(target_path)
+        import hashlib
+        after = (stat.st_size, stat.st_mtime_ns, hashlib.sha256(Path(target_path).read_bytes()).hexdigest())
+        if before is not None and after == before:
+            print(f"保存后文件未产生新鲜证据: {target_path}")
+            return False
         print(f"保存成功: {file_path or get_com_member(model, 'GetPathName')}")
     else:
         print(f"保存失败, 错误码: {errors.value}, 警告码: {warnings.value}")

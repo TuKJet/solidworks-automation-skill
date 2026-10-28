@@ -89,11 +89,14 @@ def review_drawing_layout(structure, *, padding_m=0.001, preview_evidence=None) 
     该规则只能依据 SolidWorks 返回的包围盒筛出风险，不能替代 PDF/PNG 目视复核。
     """
     views = list(structure.get("views") or [])
-    dimensions = list(structure.get("dimensions") or [])
+    dimensions = [d for d in structure.get("dimensions") or [] if d.get("visibility") not in ("hidden", 3) and d.get("visible") is not False]
     notes = list(structure.get("notes") or [])
     title_block = structure.get("title_block") or {}
     title_box = title_block.get("box")
     findings = []
+
+    def same_sheet(first, second):
+        return not first.get("sheet") or not second.get("sheet") or first["sheet"] == second["sheet"]
 
     def add_finding(code, severity, first_kind, first_name, second_kind, second_name, *, evidence_source="native", confidence="high"):
         """@brief 追加稳定字段的工程图碰撞记录。"""
@@ -109,7 +112,7 @@ def review_drawing_layout(structure, *, padding_m=0.001, preview_evidence=None) 
 
     for index, view in enumerate(views):
         for other in views[index + 1:]:
-            if _drawing_boxes_overlap(view.get("box"), other.get("box"), padding_m):
+            if same_sheet(view, other) and _drawing_boxes_overlap(view.get("box"), other.get("box"), padding_m):
                 add_finding("DRAWING_VIEW_OVERLAP", "fail", "view", view.get("name"), "view", other.get("name"))
         if _drawing_boxes_overlap(view.get("box"), title_box, padding_m):
             add_finding("DRAWING_VIEW_TITLE_BLOCK_INTRUSION", "fail", "view", view.get("name"), "title_block", "title_block")
@@ -119,7 +122,7 @@ def review_drawing_layout(structure, *, padding_m=0.001, preview_evidence=None) 
         dimension_confidence = dimension.get("box_confidence") or "high"
         dimension_severity = "warning" if dimension_source == "estimated" else "fail"
         for other in dimensions[index + 1:]:
-            if _drawing_boxes_overlap(dimension.get("box"), other.get("box"), padding_m):
+            if same_sheet(dimension, other) and _drawing_boxes_overlap(dimension.get("box"), other.get("box"), padding_m):
                 other_source = other.get("box_source") or "native"
                 source = "estimated" if "estimated" in {dimension_source, other_source} else "native"
                 confidence = min(
@@ -143,19 +146,13 @@ def review_drawing_layout(structure, *, padding_m=0.001, preview_evidence=None) 
         for view in views:
             if dimension.get("view") == view.get("name"):
                 continue
-            if _drawing_boxes_overlap(dimension.get("box"), view.get("box"), padding_m):
+            if same_sheet(dimension, view) and _drawing_boxes_overlap(dimension.get("box"), view.get("box"), padding_m):
                 add_finding(
                     "DRAWING_DIMENSION_OTHER_VIEW_INTRUSION", "warning",
                     "dimension", dimension.get("name"), "view", view.get("name"),
                     evidence_source=dimension_source,
                     confidence=dimension_confidence,
                 )
-
-    def same_sheet(first, second):
-        """@brief 只在同一图纸页内检查注释与其它对象的碰撞。"""
-        first_sheet = str(first.get("sheet") or "")
-        second_sheet = str(second.get("sheet") or "")
-        return not first_sheet or not second_sheet or first_sheet == second_sheet
 
     def evidence_for(item):
         source = item.get("box_source") or "native"
@@ -221,6 +218,15 @@ def review_drawing_layout(structure, *, padding_m=0.001, preview_evidence=None) 
                     evidence_source=source, confidence=confidence,
                 )
 
+    sheet_size = structure.get("sheet_size") or {}
+    width, height = sheet_size.get("width_m"), sheet_size.get("height_m")
+    if width and height:
+        for kind, items in (("view", views), ("dimension", dimensions), ("note", notes)):
+            for item in items:
+                box = item.get("box") or {}
+                if box and (box["left"] < 0 or box["bottom"] < 0 or box["right"] > width or box["top"] > height):
+                    add_finding("DRAWING_OUTSIDE_SHEET", "fail", kind, item.get("name") or item.get("text"),
+                                "sheet", item.get("sheet"), evidence_source=item.get("box_source") or "native")
     view_boxes_complete = bool(views) and all(item.get("box") for item in views)
     dimension_boxes_complete = not dimensions or all(item.get("box") for item in dimensions)
     note_boxes_complete = not notes or all(item.get("box") for item in notes)
@@ -311,6 +317,157 @@ def review_drawing_layout(structure, *, padding_m=0.001, preview_evidence=None) 
         "retryable": status != "pass",
         "error_code": error_code,
     }
+
+
+def build_layout_repair_plan(structure, *, max_attempts=3, padding_m=0.001):
+    """生成有限、可验证的布局修复建议，不直接修改工程图实体。
+
+    仅建议移动视图；尺寸值、尺寸实体和注释文本不会被改写或删除。视图移动
+    候选从现有包围盒、图纸边界和标题栏边界推导，执行后必须重新回读 COM
+    结构并再次调用 :func:`review_drawing_layout`。估算文字框不能作为通过证据。
+    """
+    if not isinstance(max_attempts, int) or max_attempts < 1:
+        raise ValueError("max_attempts must be a positive integer")
+    views = list((structure or {}).get("views") or [])
+    dimensions = [d for d in (structure or {}).get("dimensions") or [] if d.get("visibility") not in ("hidden", 3) and d.get("visible") is not False]
+    notes = list((structure or {}).get("notes") or [])
+    if any(not item.get("box") or item.get("box_source") in {"estimated", "unavailable"} for item in [*dimensions, *notes]):
+        return {
+            "status": "review_required",
+            "attempts": 0,
+            "actions": [],
+            "manual_review_required": True,
+            "stopped_reason": "estimated_text_box_requires_native_or_visual_review",
+        }
+    sheet = (structure or {}).get("sheet_size") or {}
+    width = sheet.get("width_m")
+    height = sheet.get("height_m")
+    title_box = ((structure or {}).get("title_block") or {}).get("box")
+    if not width or not height or not all(item.get("box") for item in views):
+        return {
+            "status": "review_required",
+            "attempts": 0,
+            "actions": [],
+            "manual_review_required": True,
+            "stopped_reason": "layout_boundary_evidence_incomplete",
+        }
+
+    review = review_drawing_layout(structure, padding_m=padding_m)
+    findings = review.get("findings") or []
+    actions = []
+
+    def footprint(view):
+        boxes = [view["box"]] + [item["box"] for item in [*dimensions, *notes]
+                                if (item.get("view") or item.get("owner_view")) == view.get("name")
+                                and (not item.get("sheet") or item.get("sheet") == view.get("sheet"))]
+        return {"left": min(b["left"] for b in boxes), "bottom": min(b["bottom"] for b in boxes),
+                "right": max(b["right"] for b in boxes), "top": max(b["top"] for b in boxes)}
+
+    def overlap(first, second):
+        return _drawing_boxes_overlap(first, second, padding_m)
+
+    def valid_position(box, dx, dy, target_name):
+        moved = {key: float(value) for key, value in box.items()}
+        moved.update({
+            "left": moved["left"] + dx,
+            "right": moved["right"] + dx,
+            "bottom": moved["bottom"] + dy,
+            "top": moved["top"] + dy,
+        })
+        if moved["left"] < 0 or moved["bottom"] < 0 or moved["right"] > float(width) or moved["top"] > float(height):
+            return False
+        if title_box and overlap(moved, title_box):
+            return False
+        return all(
+            str(other.get("name")) == str(target_name)
+            or not overlap(moved, footprint(other))
+            for other in views
+        ) and all(not overlap(moved, note["box"]) for note in notes
+                  if not (note.get("view") or note.get("owner_view")))
+
+    for finding in findings:
+        if len(actions) >= max_attempts:
+            break
+        if finding.get("code") not in {"DRAWING_VIEW_OVERLAP", "DRAWING_VIEW_TITLE_BLOCK_INTRUSION"}:
+            continue
+        first_name = finding.get("first", {}).get("name")
+        second_name = finding.get("second", {}).get("name")
+        target_name = second_name if finding.get("code") == "DRAWING_VIEW_OVERLAP" else first_name
+        target = next((item for item in views if str(item.get("name")) == str(target_name)), None)
+        if not target or not target.get("box"):
+            continue
+        box = footprint(target)
+        projection_axis = target.get("projection_axis") or target.get("orientation")
+        if projection_axis not in {"horizontal", "vertical", "x", "y"}:
+            continue
+        # Candidate deltas are derived from the colliding boxes and sheet edge;
+        # no absolute destination coordinate is invented.
+        axis_is_horizontal = projection_axis in {"horizontal", "x"}
+        candidates = (
+            [(float(width) - float(box["right"]) - float(padding_m), 0.0),
+             (-float(box["left"]) + float(padding_m), 0.0)]
+            if axis_is_horizontal else
+            [(0.0, float(height) - float(box["top"]) - float(padding_m)),
+             (0.0, -float(box["bottom"]) + float(padding_m))]
+        )
+        delta = next(((dx, dy) for dx, dy in candidates if valid_position(box, dx, dy, target_name)), None)
+        if delta is None:
+            continue
+        actions.append({
+            "kind": "move_view",
+            "target": str(target_name),
+            "delta_m": {"x": delta[0], "y": delta[1]},
+            "preserve_projection_axis": projection_axis,
+            "verify_after": ["DRAWING_VIEW_OVERLAP", "DRAWING_VIEW_TITLE_BLOCK_INTRUSION"],
+            "constraints": ["sheet_boundary", "title_block_boundary", "projection_axis"],
+        })
+        # Apply one move then inspect again; independently planned moves can
+        # collide with one another or displace attached dimensions.
+        break
+    if actions:
+        return {
+            "status": "review_required",
+            "attempts": 1,
+            "actions": actions,
+            "manual_review_required": True,
+            "stopped_reason": "bounded_plan_requires_com_verification",
+        }
+    return {
+        "status": "review_required" if findings else review.get("status", "pass"),
+        "attempts": 0,
+        "actions": [],
+        "manual_review_required": bool(findings),
+        "stopped_reason": "no_safe_view_move_derived" if findings else "no_layout_collision",
+    }
+
+
+def repair_drawing_layout(inspect, apply_action, *, max_attempts=3):
+    """Bounded repair loop. inspect must re-export/re-read the current drawing.
+
+    Callbacks keep COM execution in its owning desktop/lock. This function never
+    promotes estimates or unchanged evidence to pass and does not delete entities.
+    """
+    if not isinstance(max_attempts, int) or not 1 <= max_attempts <= 20:
+        raise ValueError("max_attempts must be between 1 and 20")
+    history, seen = [], set()
+    for attempt in range(max_attempts + 1):
+        structure = inspect()
+        review = review_drawing_layout(structure)
+        fingerprint = json.dumps(structure, sort_keys=True, default=str)
+        if review["status"] == "pass":
+            return {"status": "pass", "history": history, "review": review, "stopped_reason": "verified"}
+        reason = "no_progress" if fingerprint in seen else "attempt_limit" if attempt == max_attempts else None
+        if reason:
+            return {"status": review["status"], "history": history, "review": review, "stopped_reason": reason}
+        seen.add(fingerprint)
+        plan = build_layout_repair_plan(structure, max_attempts=max_attempts - attempt)
+        if not plan["actions"]:
+            return {"status": review["status"], "history": history, "review": review, "stopped_reason": plan["stopped_reason"]}
+        action = plan["actions"][0]
+        result = apply_action(action)
+        history.append({"action": action, "result": result})
+        if not result or isinstance(result, dict) and result.get("status") not in {"pass", "ok"}:
+            return {"status": "blocked", "history": history, "review": review, "stopped_reason": "action_failed"}
 
 
 def _expand_path(path):

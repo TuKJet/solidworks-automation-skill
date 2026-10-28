@@ -498,6 +498,23 @@
         "interactive",
         "reviewed"
       ]
+    },
+    {
+      "id": "project_drawing_delivery_pipeline",
+      "label": "工程清单、批量出图复核与可追溯交付",
+      "level": "pilot",
+      "skills": ["solidworks-automation", "solidworks-engineering-drawing"],
+      "backends": ["solidworks-com", "local-python"],
+      "verified_versions": [],
+      "dependencies": ["python", "pywin32", "PyMuPDF", "ezdxf", "matplotlib"],
+      "limitations": [
+        "上下文、比例继承、可见尺寸、注释、布局、导出和制造完整性分别检查；API 失败不可由文件存在覆盖。",
+        "SW2025 项目回归证据按 run 保存；未据此提升其他版本或整个能力为 verified。",
+        "密集尺寸仅映射有真实端点和值证据的维度；未覆盖项保留在原图，附页需目视复核。",
+        "跨进程协作锁只约束使用本技能的调用者；其他 CAD 写入任务必须先停止或另用会话。",
+        "BOM 的缺件、临时路径、抑制项和未知制造信息保持显式；自包含打包必须重开核验。"
+      ],
+      "allowed_modes": ["interactive", "reviewed"]
     }
   ]
 }

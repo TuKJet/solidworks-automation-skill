@@ -8,10 +8,10 @@ from pathlib import Path
 
 try:
     from scripts.sw_preflight import import_com_dependencies
-    from scripts.sw_connect import create_empty_dispatch_variant, get_com_member
+    from scripts.sw_connect import activate_document_verified, create_empty_dispatch_variant, get_com_member
 except ImportError:
     from sw_preflight import import_com_dependencies
-    from sw_connect import create_empty_dispatch_variant, get_com_member
+    from sw_connect import activate_document_verified, create_empty_dispatch_variant, get_com_member
 
 pythoncom, _win32com, VARIANT = import_com_dependencies()
 
@@ -25,6 +25,7 @@ PAPER_SIZES = {
     "A1": {"code": 10, "width_m": 0.841, "height_m": 0.594},
     "A0": {"code": 11, "width_m": 1.189, "height_m": 0.841},
 }
+PAPER_SIZE_CODES = {6: "A4", 7: "A4", 8: "A3", 9: "A2", 10: "A1", 11: "A0"}
 
 STANDARD_DRAWING_SCALES = (10.0, 5.0, 2.0, 1.0, 0.5, 0.2, 0.1, 0.05, 0.02, 0.01)
 
@@ -47,6 +48,19 @@ AUTO_CENTER_MARK_TARGETS = {
     "fillets": 2,
     "slots": 4,
 }
+
+# SolidWorks.Interop.swconst.swAnnotationVisibilityState_e.  半隐藏的尺寸不应
+# 参与自动排列；只有 swAnnotationVisible 才能安全交给 AlignDimensions。
+ANNOTATION_VISIBILITY = {
+    0: "unknown",
+    1: "visible",
+    2: "hidden",
+    3: "hidden",
+}
+
+# SolidWorks.Interop.swconst.swDimensionType_e.  系统值的长度单位为米，角度
+# 尺寸（含角度坐标）则为弧度；不要把显示的毫米/度字符串当作系统值。
+ANGULAR_DIMENSION_TYPES = {3, 16}
 
 
 def _safe_member(obj, name, *args, default=None):
@@ -109,6 +123,225 @@ def _sheet_dimensions(sheet):
                 "source": "GetSize",
             }
     return None
+
+
+def _sheet_scale(sheet):
+    """@brief 回读 sheet 的真实比例，失败时明确标为 unavailable。"""
+    for method_name in ("GetProperties2", "GetProperties"):
+        values = _as_sequence(_safe_member(sheet, method_name, default=[]))
+        if len(values) <= 3:
+            continue
+        try:
+            numerator, denominator = float(values[2]), float(values[3])
+        except (TypeError, ValueError):
+            continue
+        if all(math.isfinite(item) and item > 0 for item in (numerator, denominator)):
+            width_m = height_m = None
+            if len(values) > 6:
+                try:
+                    width_m, height_m = float(values[5]), float(values[6])
+                    if not all(math.isfinite(item) and item > 0 for item in (width_m, height_m)):
+                        width_m = height_m = None
+                except (TypeError, ValueError):
+                    width_m = height_m = None
+            try:
+                paper_size_code = int(values[0])
+            except (IndexError, TypeError, ValueError):
+                paper_size_code = None
+            try:
+                template_in = int(values[1])
+            except (IndexError, TypeError, ValueError):
+                template_in = None
+            return {
+                "numerator": numerator,
+                "denominator": denominator,
+                "source": method_name,
+                "first_angle": bool(values[4]) if len(values) > 4 else None,
+                "paper_size_code": paper_size_code,
+                "paper_size": PAPER_SIZE_CODES.get(paper_size_code),
+                "template_in": template_in,
+                "width_m": width_m,
+                "height_m": height_m,
+                "orientation": "portrait" if width_m is not None and height_m > width_m else "landscape" if width_m is not None else None,
+            }
+    return {
+        "numerator": None, "denominator": None, "source": "unavailable", "first_angle": None,
+        "paper_size_code": None, "paper_size": None, "template_in": None,
+        "width_m": None, "height_m": None, "orientation": None,
+    }
+
+
+def _view_scale_state(view):
+    """@brief 记录视图比例链，供 SetupSheet6 后逐项验证/必要时恢复。"""
+    ratio = _as_sequence(_safe_member(view, "ScaleRatio", default=[]))
+    try:
+        numerator, denominator = float(ratio[0]), float(ratio[1])
+        if not all(math.isfinite(item) and item > 0 for item in (numerator, denominator)):
+            raise ValueError
+        scale_ratio = [numerator, denominator]
+    except (IndexError, TypeError, ValueError):
+        scale_ratio = None
+    return {
+        "name": str(_safe_member(view, "Name", default="") or ""),
+        "scale_ratio": scale_ratio,
+        "use_sheet_scale": _safe_member(view, "UseSheetScale", default=None),
+        "use_parent_scale": _safe_member(view, "UseParentScale", default=None),
+    }
+
+
+def _sheet_view_scale_states(sheet):
+    return [_view_scale_state(view) for view in _as_sequence(_safe_member(sheet, "GetViews", default=[]))]
+
+
+def _set_view_property(view, name, value):
+    """@brief 仅在 COM 属性可写时设置；失败由调用方记录，不静默改比例。"""
+    try:
+        setattr(view, name, value)
+        return True
+    except Exception:
+        return False
+
+
+def _restore_view_scale_states(sheet, before_states):
+    """@brief SetupSheet6 意外改变独立 view 时恢复其比例链。
+
+    ``ScaleRatio`` 可能令视图脱离 sheet/parent scale，因此先恢复数值比例，
+    再恢复两个依附标志。只在回读不一致时写入，避免对真实 COM 做无谓变更。
+    """
+    before_by_name = {item["name"]: item for item in before_states if item["name"]}
+    outcomes = []
+    for index, view in enumerate(_as_sequence(_safe_member(sheet, "GetViews", default=[]))):
+        name = str(_safe_member(view, "Name", default="") or "")
+        before = before_by_name.get(name) or (before_states[index] if index < len(before_states) else None)
+        if before is None:
+            continue
+        current = _view_scale_state(view)
+        changed = []
+        if before["scale_ratio"] is not None and current["scale_ratio"] != before["scale_ratio"]:
+            if _set_view_property(view, "ScaleRatio", tuple(before["scale_ratio"])):
+                changed.append("ScaleRatio")
+        for property_name, key in (("UseParentScale", "use_parent_scale"), ("UseSheetScale", "use_sheet_scale")):
+            if before[key] is not None and current[key] != before[key]:
+                if _set_view_property(view, property_name, before[key]):
+                    changed.append(property_name)
+        outcomes.append({"name": name, "restored": changed, "before": before, "after": _view_scale_state(view)})
+    return outcomes
+
+
+def _same_scale_ratio(expected, actual):
+    """@brief 严格但浮点容忍地比较 SolidWorks 比例分子/分母。"""
+    if expected is None or actual is None:
+        return expected is actual
+    return (
+        len(expected) == len(actual) == 2
+        and all(math.isclose(float(left), float(right), rel_tol=1e-12, abs_tol=1e-12)
+                for left, right in zip(expected, actual))
+    )
+
+
+def _verify_view_scale_states(sheet, before_states):
+    """@brief 恢复后逐项回读比例与依附标志；未知值不冒充验证通过。"""
+    before_by_name = {item["name"]: item for item in before_states if item["name"]}
+    checks = []
+    for index, view in enumerate(_as_sequence(_safe_member(sheet, "GetViews", default=[]))):
+        name = str(_safe_member(view, "Name", default="") or "")
+        before = before_by_name.get(name) or (before_states[index] if index < len(before_states) else None)
+        if before is None:
+            checks.append({"name": name, "status": "unknown", "reason": "view_not_found_in_pre_setup_state"})
+            continue
+        actual = _view_scale_state(view)
+        matched = (
+            _same_scale_ratio(before["scale_ratio"], actual["scale_ratio"])
+            and all(
+                before[key] == actual[key]
+                for key in ("use_sheet_scale", "use_parent_scale")
+            )
+        )
+        checks.append({"name": name, "status": "pass" if matched else "failed", "before": before, "actual": actual})
+    missing = len(checks) != len(before_states)
+    if missing:
+        checks.append({"name": None, "status": "failed", "reason": "view_count_changed"})
+    return checks
+
+
+def _setup_scale_preflight(scale_before, view_scales_before):
+    """@brief 不允许已有视图在未知图纸比例下被 SetupSheet6 隐式改为 1:1。"""
+    if scale_before["numerator"] is not None and scale_before["denominator"] is not None:
+        return None
+    if view_scales_before:
+        return {
+            "status": "blocked",
+            "error_code": "DRAWING_SHEET_SCALE_UNAVAILABLE",
+            "message": "当前页已有视图但无法读取图纸比例；拒绝以默认 1:1 覆盖。",
+        }
+    return None
+
+
+def _effective_projection(projection, scale_before, view_scales_before):
+    """@brief 未指定投影法时保留 GetProperties2[4]；仅空白页允许明确标记的默认。"""
+    if projection is not None:
+        normalized = str(projection).lower()
+        if normalized not in {"first_angle", "third_angle"}:
+            raise ValueError("projection 必须是 first_angle 或 third_angle")
+        return normalized, "requested"
+    if scale_before["first_angle"] is not None:
+        return ("first_angle" if scale_before["first_angle"] else "third_angle"), "sheet_properties"
+    if view_scales_before:
+        return None, "unavailable"
+    # 新建的空 drawing 没有可保留的历史属性；此处不是静默保留，结果会注明来源。
+    return "first_angle", "blank_sheet_default"
+
+
+def _effective_sheet_format(paper_size, orientation, scale_before, view_scales_before):
+    """@brief 确定 SetupSheet6 纸张参数；有 view 时默认保留同类别旧页方向。"""
+    if orientation is not None:
+        requested_orientation = str(orientation).lower()
+        if requested_orientation not in {"portrait", "landscape"}:
+            raise ValueError("orientation 必须是 portrait 或 landscape")
+    else:
+        requested_orientation = None
+    has_views = bool(view_scales_before)
+    same_category = scale_before.get("paper_size") == paper_size
+    if has_views and requested_orientation is None and same_category:
+        if all(scale_before.get(key) is not None for key in ("paper_size_code", "width_m", "height_m")):
+            return {
+                "paper_size_code": scale_before["paper_size_code"],
+                "template_width_m": scale_before["width_m"],
+                "template_height_m": scale_before["height_m"],
+                "orientation": scale_before["orientation"],
+                "orientation_source": "existing_sheet",
+                "preserved_existing_format": True,
+            }
+        return None
+    actual_orientation = requested_orientation or "landscape"
+    width_m, height_m = PAPER_SIZES[paper_size]["width_m"], PAPER_SIZES[paper_size]["height_m"]
+    paper_size_code = PAPER_SIZES[paper_size]["code"]
+    if actual_orientation == "portrait":
+        width_m, height_m = height_m, width_m
+        # SolidWorks has a dedicated A4-vertical enum; other sizes retain their
+        # standard enum and use explicit width/height rather than guessing a code.
+        if paper_size == "A4":
+            paper_size_code = 7
+    return {
+        "paper_size_code": paper_size_code,
+        "template_width_m": width_m,
+        "template_height_m": height_m,
+        "orientation": actual_orientation,
+        "orientation_source": "requested" if requested_orientation else "blank_sheet_default",
+        "preserved_existing_format": False,
+    }
+
+
+def _sheet_format_matches(expected, actual):
+    """@brief 对保留/显式请求的纸张枚举与宽高做回读核验。"""
+    if expected is None or actual is None:
+        return False
+    if actual.get("paper_size_code") != expected["paper_size_code"]:
+        return False
+    return all(
+        math.isclose(float(actual.get(key) or 0), float(expected[expected_key]), rel_tol=1e-12, abs_tol=1e-12)
+        for key, expected_key in (("width_m", "template_width_m"), ("height_m", "template_height_m"))
+    )
 
 
 def _normalise_box(value):
@@ -190,10 +423,18 @@ def auto_arrange_drawing_dimensions(drawing_model, *, spacing_m=0.01, mode="auto
             dimensions = _view_display_dimensions(view)
             _safe_member(drawing_model, "ClearSelection2", True)
             selected = 0
+            visible_count = 0
             for dimension in dimensions:
                 annotation = _safe_member(dimension, "GetAnnotation")
                 if annotation is None:
                     continue
+                try:
+                    visibility_value = int(_safe_member(annotation, "Visible", default=0))
+                except (TypeError, ValueError):
+                    visibility_value = 0
+                if ANNOTATION_VISIBILITY.get(visibility_value, "unknown") != "visible":
+                    continue
+                visible_count += 1
                 selected_ok = _safe_member(annotation, "Select2", selected > 0, 0, default=False)
                 if not selected_ok:
                     selected_ok = _safe_member(annotation, "Select", selected > 0, default=False)
@@ -211,6 +452,7 @@ def auto_arrange_drawing_dimensions(drawing_model, *, spacing_m=0.01, mode="auto
                 "sheet": str(sheet_name),
                 "view": str(_safe_member(view, "Name", default="") or ""),
                 "dimension_count": len(dimensions),
+                "visible_dimension_count": visible_count,
                 "selected_count": selected,
                 "attempted": attempted,
                 "aligned": aligned,
@@ -1088,6 +1330,11 @@ def _note_text(note):
         return ""
 
 
+def _normalise_note_text(value):
+    """@brief 按逻辑行比较 Note 文本，避免 CRLF/LF COM 往返造成假失败。"""
+    return str(value or "").replace("\r\n", "\n").replace("\r", "\n")
+
+
 def _note_annotation(note):
     """@brief 获取 INote 对应的 IAnnotation；动态 COM 不公开该成员时按类型库调用。"""
     annotation = _safe_member(note, "GetAnnotation")
@@ -1160,6 +1407,81 @@ def _note_evidence(note):
     }
 
 
+def _leave_template_edit_mode(drawing_model):
+    """@brief 普通图纸 Note 不能落在 sheet format；必要时先切回 EditSheet。"""
+    editing_sheet = _safe_member(drawing_model, "GetEditSheet", default=None)
+    if editing_sheet is False:
+        _safe_member(drawing_model, "EditSheet")
+        return _safe_member(drawing_model, "GetEditSheet", default=None) is True
+    return editing_sheet is not False
+
+
+def _disable_annotation_leader(annotation):
+    """@brief 强制普通 Note 为无引线，并回读可用的样式证据。"""
+    if annotation is None:
+        return None
+    result = _safe_member(annotation, "SetLeader3", 0, 0, False, False, False, False, default=None)
+    leader_style = _safe_member(annotation, "GetLeaderStyle", default=None)
+    if leader_style is not None:
+        try:
+            return int(leader_style) == 0
+        except (TypeError, ValueError):
+            return False
+    if result is not None:
+        # Some generated COM wrappers expose SetLeader3's success Boolean while
+        # others expose a zero HRESULT.  A void result deliberately falls through
+        # to ``None`` above and cannot certify an absent leader.
+        if isinstance(result, bool):
+            return result
+        try:
+            return int(result) == 0
+        except (TypeError, ValueError):
+            return None
+    return None
+
+
+def update_notes(note_updates):
+    """@brief 用 INote.SetText 更新已解析的 Note，并逐项回读验证。
+
+    ``note_updates`` 的每项为 ``(note, text)`` 或 ``{"note": note,
+    "text": text}``。函数不按显示值或文本去重，以免合并不同位置的同文 Note。
+    """
+    results = []
+    for item in _as_sequence(note_updates):
+        if isinstance(item, dict):
+            note, requested_text = item.get("note"), item.get("text")
+        else:
+            try:
+                note, requested_text = item
+            except (TypeError, ValueError):
+                results.append({"updated": False, "status": "failed", "error_code": "DRAWING_NOTE_UPDATE_INPUT_INVALID"})
+                continue
+        expected_text = str(requested_text)
+        if note is None:
+            results.append({"text": expected_text, "updated": False, "status": "failed", "error_code": "DRAWING_NOTE_UPDATE_INPUT_INVALID"})
+            continue
+        try:
+            set_result = get_com_member(note, "SetText", expected_text)
+            wrote = set_result is not False
+        except Exception:
+            wrote = False
+        actual_text = _note_text(note)
+        verified = bool(wrote and _normalise_note_text(actual_text) == _normalise_note_text(expected_text))
+        results.append({
+            "text": expected_text,
+            "text_evidence": actual_text,
+            "updated": wrote,
+            "verified": verified,
+            "status": "pass" if verified else "failed",
+            "error_code": None if verified else "DRAWING_NOTE_TEXT_UPDATE_UNVERIFIED",
+        })
+    return {
+        "status": "pass" if results and all(item["verified"] for item in results) else "failed",
+        "updates": results,
+        "updated_count": sum(1 for item in results if item.get("updated")),
+    }
+
+
 def add_note(drawing_model, x, y, text):
     """@brief 创建并验证工程图文字注释。
 
@@ -1177,6 +1499,15 @@ def add_note(drawing_model, x, y, text):
             "status": "failed",
             "error_code": "DRAWING_NOTE_INPUT_INVALID",
         }
+    if not _leave_template_edit_mode(drawing_model):
+        return {
+            "text": expected_text,
+            "created": False,
+            "status": "failed",
+            "error_code": "DRAWING_NOTE_EDIT_SHEET_REQUIRED",
+        }
+    # InsertNote 从当前选择集取 leader attachment；必须先清空。
+    _safe_member(drawing_model, "ClearSelection2", True)
     note = _safe_member(drawing_model, "InsertNote", expected_text)
     if note is None:
         return {
@@ -1186,31 +1517,36 @@ def add_note(drawing_model, x, y, text):
             "error_code": "DRAWING_NOTE_INSERT_FAILED",
         }
     annotation = _note_annotation(note)
+    leader_disabled = _disable_annotation_leader(annotation)
     positioned = _set_annotation_position(annotation, float(x), float(y)) if annotation is not None else False
     if positioned:
         # 刷新文字与坐标；边界仍必须在视图重枚举后的结构审查阶段读取。
         _safe_member(drawing_model, "ForceRebuild3", False)
     evidence = _note_evidence(note)
     position = evidence.get("position_m") or []
-    text_matches = evidence.get("text") == expected_text
+    text_matches = _normalise_note_text(evidence.get("text")) == _normalise_note_text(expected_text)
     position_matches = (
         len(position) >= 2
         and math.isclose(position[0], float(x), abs_tol=1e-6)
         and math.isclose(position[1], float(y), abs_tol=1e-6)
     )
-    verified = bool(positioned and text_matches and position_matches)
+    # A void SetLeader3 call is not evidence.  Only a successful setter return or
+    # a subsequent GetLeaderStyle readback of ``0`` can prove this ordinary note
+    # has no leader attachment.
+    verified = bool(positioned and text_matches and position_matches and leader_disabled is True)
     return {
         "text": expected_text,
         "created": True,
         "position_requested_m": [float(x), float(y), 0.0],
         "positioned": positioned,
+        "leader_disabled": leader_disabled,
         "text_evidence": evidence.get("text"),
         "position_evidence_m": position,
         "box": None,
         "box_source": "deferred_to_structure_inspection",
         "verified": verified,
         "status": "pass" if verified else "failed",
-        "error_code": None if verified else "DRAWING_NOTE_COM_EVIDENCE_MISSING",
+        "error_code": None if verified else "DRAWING_NOTE_LEADER_UNVERIFIED" if leader_disabled is None else "DRAWING_NOTE_COM_EVIDENCE_MISSING",
     }
 
 
@@ -1281,7 +1617,14 @@ def add_a3_sheet(drawing_model, template_candidates, *, require_gbt=True, projec
     }
 
 
-def setup_current_sheet_as_a3(drawing_model, template_candidates, *, require_gbt=True, projection="first_angle") -> dict:
+def setup_current_sheet_as_a3(
+    drawing_model,
+    template_candidates,
+    *,
+    require_gbt=True,
+    projection=None,
+    preserve_format_notes=True,
+) -> dict:
     """@brief 使用 IDrawingDoc.SetupSheet6 将当前页设置为横向 A3。"""
     selection = select_drawing_template(template_candidates, paper_size="A3", require_gbt=require_gbt)
     if selection["selected"] is None:
@@ -1302,9 +1645,29 @@ def setup_current_sheet_as_a3(drawing_model, template_candidates, *, require_gbt
             "configured": False,
             "error_code": "DRAWING_CURRENT_SHEET_MISSING",
         }
-    projection = str(projection).lower()
-    if projection not in {"first_angle", "third_angle"}:
-        raise ValueError("projection 必须是 first_angle 或 third_angle")
+    scale_before = _sheet_scale(sheet)
+    view_scales_before = _sheet_view_scale_states(sheet)
+    scale_block = _setup_scale_preflight(scale_before, view_scales_before)
+    projection, projection_source = _effective_projection(projection, scale_before, view_scales_before)
+    if scale_block or projection is None:
+        blocker = scale_block or {
+            "status": "blocked",
+            "error_code": "DRAWING_SHEET_PROJECTION_UNAVAILABLE",
+            "message": "当前页已有视图但无法读取投影法；拒绝以默认投影覆盖。",
+        }
+        return {
+            **selection,
+            **blocker,
+            "stage": "preflight",
+            "retryable": True,
+            "configured": False,
+            "sheet_scale_before": scale_before,
+            "view_scales_before": view_scales_before,
+            "projection": projection,
+            "projection_source": projection_source,
+        }
+    scale1 = scale_before["numerator"] if scale_before["numerator"] is not None else 1.0
+    scale2 = scale_before["denominator"] if scale_before["denominator"] is not None else 1.0
     try:
         configured = bool(get_com_member(
             drawing_model,
@@ -1312,14 +1675,14 @@ def setup_current_sheet_as_a3(drawing_model, template_candidates, *, require_gbt
             sheet_name,
             PAPER_SIZES["A3"]["code"],
             12,
-            1.0,
-            1.0,
+            scale1,
+            scale2,
             projection == "first_angle",
             selection["selected"],
             0.0,
             0.0,
             "",
-            False,
+            not bool(preserve_format_notes),
             0.0,
             0.0,
             0.0,
@@ -1337,15 +1700,83 @@ def setup_current_sheet_as_a3(drawing_model, template_candidates, *, require_gbt
             "error_code": "DRAWING_A3_SETUP_FAILED",
             "error": str(exc),
         }
+    configured_sheet = _safe_member(drawing_model, "GetCurrentSheet") if configured else sheet
+    view_scale_restoration = _restore_view_scale_states(configured_sheet, view_scales_before) if configured else []
+    view_scale_verification = _verify_view_scale_states(configured_sheet, view_scales_before) if configured else []
+    view_scales_preserved = bool(configured) and all(item["status"] == "pass" for item in view_scale_verification)
+    scale_after = _sheet_scale(configured_sheet) if configured else None
+    sheet_scale_preserved = bool(configured) and _same_scale_ratio(
+        [scale_before["numerator"], scale_before["denominator"]],
+        [scale_after["numerator"], scale_after["denominator"]],
+    ) if scale_before["numerator"] is not None else bool(configured)
+    verified = configured and view_scales_preserved and sheet_scale_preserved
     return {
         **selection,
-        "status": "pass" if configured else "failed",
+        "status": "pass" if verified else "review_required" if configured else "failed",
         "stage": "create",
         "retryable": not configured,
         "configured": configured,
         "sheet_name": sheet_name,
         "projection": projection,
-        "error_code": None if configured else "DRAWING_A3_SETUP_FAILED",
+        "projection_source": projection_source,
+        "sheet_scale_before": scale_before,
+        "sheet_scale_after": scale_after,
+        "sheet_scale_preserved": sheet_scale_preserved,
+        "view_scales_before": view_scales_before,
+        "view_scale_restoration": view_scale_restoration,
+        "view_scale_verification": view_scale_verification,
+        "view_scales_preserved": view_scales_preserved,
+        "preserve_format_notes": bool(preserve_format_notes),
+        "remove_modified_format_notes": not bool(preserve_format_notes),
+        "error_code": None if verified else "DRAWING_VIEW_SCALE_PRESERVATION_UNVERIFIED" if configured else "DRAWING_A3_SETUP_FAILED",
+    }
+
+
+def save_current_sheet_format(drawing_model, output_path) -> dict:
+    """@brief 以 ISheet.SaveFormat 导出当前图纸嵌入的 sheet format 副本。
+
+    这用于原始 TemplateName 指向已不可用的外部文件、但图纸内嵌图框仍可正常
+    使用的场景。只保存明确请求的副本，不修改当前 sheet 或猜测其他模板路径。
+    """
+    target = Path(output_path).expanduser().resolve()
+    if target.suffix.lower() != ".slddrt":
+        return {
+            "status": "blocked", "saved": False,
+            "error_code": "DRAWING_SHEET_FORMAT_EXTENSION_INVALID",
+            "manual_review_required": True,
+        }
+    sheet = _safe_member(drawing_model, "GetCurrentSheet")
+    sheet_name = str(_safe_member(sheet, "GetName", default="") or "")
+    if not sheet_name:
+        return {
+            "status": "blocked", "saved": False,
+            "error_code": "DRAWING_CURRENT_SHEET_MISSING",
+            "manual_review_required": True,
+        }
+    target.parent.mkdir(parents=True, exist_ok=True)
+    before = (target.stat().st_mtime_ns, target.stat().st_size) if target.is_file() else None
+    try:
+        saved = bool(get_com_member(sheet, "SaveFormat", str(target)))
+    except Exception as exc:
+        return {
+            "status": "failed", "saved": False, "sheet_name": sheet_name,
+            "path": str(target), "error_code": "DRAWING_SHEET_FORMAT_SAVE_FAILED",
+            "error": str(exc), "manual_review_required": True,
+        }
+    exists = target.is_file() and target.stat().st_size > 0
+    after = (target.stat().st_mtime_ns, target.stat().st_size) if exists else None
+    fresh = exists and (before is None or before != after)
+    verified = saved and fresh
+    return {
+        "status": "pass" if verified else "failed",
+        "saved": saved,
+        "verified": verified,
+        "sheet_name": sheet_name,
+        "path": str(target),
+        "source_template_name": str(_safe_member(sheet, "GetTemplateName", default="") or ""),
+        "size_bytes": target.stat().st_size if exists else 0,
+        "error_code": None if verified else "DRAWING_SHEET_FORMAT_SAVE_UNVERIFIED",
+        "manual_review_required": not verified,
     }
 
 
@@ -1542,6 +1973,143 @@ def _collect_view_professional_annotations(view, view_record):
     return result
 
 
+def _display_dimension_model_dimension(display_dimension):
+    """@brief 优先使用未废弃的 GetDimension2(0)，兼容旧版本回退。"""
+    return (
+        _safe_member(display_dimension, "GetDimension2", 0)
+        or _safe_member(display_dimension, "GetDimension")
+    )
+
+
+def _dimension_visibility(display_dimension, model_dimension):
+    """@brief 仅依 IAnnotation.Visible 判定可见性；模型尺寸存在不等于图纸可见。"""
+    annotation = _safe_member(display_dimension, "GetAnnotation")
+    raw_visible = _safe_member(annotation, "Visible", default=None)
+    try:
+        visibility = ANNOTATION_VISIBILITY.get(int(raw_visible), "unknown")
+    except (TypeError, ValueError):
+        visibility = "unknown"
+    if visibility in {"visible", "hidden"}:
+        return visibility, raw_visible, model_dimension is not None
+    return "unknown", raw_visible, model_dimension is not None
+
+
+def _normalise_model_dimension_name(model_dimension_name, view_name):
+    """@brief 只剥离与已知绘图视图完全匹配的末尾 ``@View``，保留特征名内的 @。"""
+    raw_name = str(model_dimension_name or "")
+    known_view_name = str(view_name or "").strip().lstrip("*")
+    if not raw_name or not known_view_name:
+        return raw_name, False
+    suffix = "@" + known_view_name
+    if raw_name.casefold().endswith(suffix.casefold()):
+        return raw_name[:-len(suffix)].rstrip(), True
+    return raw_name, False
+
+
+def _dimension_identity(view, display_dimension, model_dimension):
+    """@brief 构造不含数值的 source/config/model-dimension 规范身份。"""
+    source_document = _safe_member(view, "ReferencedDocument")
+    source = (
+        _safe_member(source_document, "GetPathName", default=None)
+        or _safe_member(source_document, "GetTitle", default=None)
+        or _safe_member(view, "ReferencedDocumentName", default=None)
+    )
+    configuration = _safe_member(view, "ReferencedConfiguration", default=None)
+    model_dimension_name = (
+        _safe_member(model_dimension, "FullName", default=None)
+        or _safe_member(model_dimension, "GetNameForSelection", default=None)
+        or _safe_member(display_dimension, "GetNameForSelection", default=None)
+        or _safe_member(display_dimension, "Name", default=None)
+    )
+    normalized_name, view_suffix_removed = _normalise_model_dimension_name(
+        model_dimension_name,
+        _safe_member(view, "Name", default=""),
+    )
+    identity = {
+        "source": str(source) if source else None,
+        "configuration": str(configuration) if configuration else None,
+        "model_dimension": normalized_name or None,
+        "model_dimension_raw": str(model_dimension_name) if model_dimension_name else None,
+        "model_dimension_view_suffix_removed": view_suffix_removed,
+    }
+    if all(identity[key] for key in ("source", "configuration", "model_dimension")):
+        identity["canonical_key"] = "|".join((identity["source"], identity["configuration"], identity["model_dimension"]))
+    else:
+        identity["canonical_key"] = None
+    return identity
+
+
+def _dimension_system_value(display_dimension, model_dimension):
+    """@brief 读取模型系统值；长度=米，角度=弧度，绝不按显示文本推断。"""
+    dimension_type = _safe_member(display_dimension, "Type2", default=None)
+    if dimension_type is None:
+        dimension_type = _safe_member(display_dimension, "Type", default=None)
+    try:
+        normalized_type = int(dimension_type)
+    except (TypeError, ValueError):
+        normalized_type = dimension_type
+    raw_value = _safe_member(model_dimension, "SystemValue", default=None)
+    try:
+        value = float(raw_value)
+        if not math.isfinite(value):
+            raise ValueError
+    except (TypeError, ValueError):
+        value = None
+    angular = normalized_type in ANGULAR_DIMENSION_TYPES
+    return {
+        "value": value,
+        "unit": "rad" if angular else "m",
+        "value_mm": value * 1000.0 if value is not None and not angular else None,
+        "value_degrees": math.degrees(value) if value is not None and angular else None,
+        "type": normalized_type,
+        "source": "IDimension.SystemValue" if value is not None else "unavailable",
+    }
+
+
+def _view_projection_relationships(sheet_views):
+    """Derive a projected view's movable axis only from its actual base relation.
+
+    ``IView.GetBaseView`` is the parent evidence.  A view name such as ``Top`` is
+    not positional evidence: a section/detail/auxiliary view may use that name,
+    so it stays non-movable unless its measured center delta to the base is axis
+    aligned.  Child linkage must also be observable before an automated move.
+    """
+    views = list(sheet_views or [])
+    names = [str(_safe_member(view, "Name", default="") or "") for view in views]
+    name_count = {name: names.count(name) for name in names if name}
+    base_info = {}
+    linkage_observable = all(getattr(view, "GetBaseView", None) is not None for view in views)
+    for view, name in zip(views, names):
+        base = _safe_member(view, "GetBaseView") if getattr(view, "GetBaseView", None) is not None else None
+        base_name = str(_safe_member(base, "Name", default="") or "") if base is not None else ""
+        position, base_position = _view_position(view), _view_position(base)
+        axis = None
+        if base is not None and position is not None and base_position is not None:
+            delta_x, delta_y = position[0] - base_position[0], position[1] - base_position[1]
+            tolerance = 1e-6
+            if abs(delta_x) > tolerance and abs(delta_y) <= tolerance:
+                axis = "horizontal"
+            elif abs(delta_y) > tolerance and abs(delta_x) <= tolerance:
+                axis = "vertical"
+        base_info[id(view)] = {
+            "base_view_name": base_name or None,
+            "projection_axis": axis,
+            "projection_axis_evidence": "base_view_position_delta" if axis else "insufficient",
+            "parent_relation_verified": bool(base is not None and base_name and name_count.get(base_name) == 1 and base_position is not None),
+        }
+    for view, name in zip(views, names):
+        children = [
+            child_name for child, child_name in zip(views, names)
+            if child is not view and base_info.get(id(child), {}).get("base_view_name") == name and name_count.get(name) == 1
+        ]
+        base_info[id(view)].update({
+            "child_view_names": children,
+            "child_view_count": len(children),
+            "child_linkage_verified": bool(linkage_observable and name and name_count.get(name) == 1),
+        })
+    return base_info
+
+
 def inspect_drawing_structure(drawing_model, *, paper_size_hint=None, title_block_box=None) -> dict:
     """@brief 读取工程图结构并返回可审计报告，不修改文档。"""
     sheets = _as_sequence(_safe_member(drawing_model, "GetSheetNames", default=[]))
@@ -1568,7 +2136,10 @@ def inspect_drawing_structure(drawing_model, *, paper_size_hint=None, title_bloc
         sheet_views = _as_sequence(_safe_member(sheet, "GetViews", default=[]))
         mapped_views, _, _ = _map_standard_views_from_sheet_views(sheet_views)
         semantic_by_object = {id(view): name for name, view in mapped_views.items()}
+        relationship_by_object = _view_projection_relationships(sheet_views)
         for view in sheet_views:
+            relationship = relationship_by_object.get(id(view), {})
+            position = _view_position(view)
             view_record = {
                 "sheet": str(sheet_name),
                 "name": _safe_member(view, "Name", default=""),
@@ -1576,7 +2147,9 @@ def inspect_drawing_structure(drawing_model, *, paper_size_hint=None, title_bloc
                 "orientation": _safe_member(view, "GetOrientationName", default=""),
                 "semantic_view": semantic_by_object.get(id(view), ""),
                 "scale": _safe_member(view, "ScaleRatio", default=None),
+                "position": list(position) if position is not None else None,
                 "box": _normalise_box(_safe_member(view, "GetOutline")),
+                **relationship,
             }
             views.append(view_record)
             view_annotations = _collect_view_professional_annotations(view, view_record)
@@ -1584,6 +2157,10 @@ def inspect_drawing_structure(drawing_model, *, paper_size_hint=None, title_bloc
                 professional_annotations[key].extend(records)
             view_dimensions = _view_display_dimensions(view)
             for dimension in view_dimensions:
+                model_dimension = _display_dimension_model_dimension(dimension)
+                visibility, raw_visibility, stored = _dimension_visibility(dimension, model_dimension)
+                identity = _dimension_identity(view, dimension, model_dimension)
+                system_value = _dimension_system_value(dimension, model_dimension)
                 native_box = _annotation_box(dimension)
                 estimated_box_evidence = estimate_dimension_text_box(dimension) if native_box is None else None
                 dimension_record = {
@@ -1596,7 +2173,13 @@ def inspect_drawing_structure(drawing_model, *, paper_size_hint=None, title_bloc
                         or _safe_member(_safe_member(dimension, "GetDimension"), "FullName", default="")
                     ),
                     "type": _safe_member(dimension, "Type", default=None),
+                    "type2": system_value["type"],
                     "text": _safe_member(dimension, "GetText", 0, default=""),
+                    "visibility": visibility,
+                    "annotation_visible": raw_visibility,
+                    "stored": stored,
+                    "identity": identity,
+                    "system_value": system_value,
                     "box": native_box or estimated_box_evidence.get("box"),
                     "box_source": "native" if native_box else estimated_box_evidence.get("source"),
                     "box_confidence": "high" if native_box else estimated_box_evidence.get("confidence"),
@@ -1671,6 +2254,7 @@ def inspect_drawing_structure(drawing_model, *, paper_size_hint=None, title_bloc
     native_dimension_box_count = sum(item.get("box_source") == "native" for item in dimensions)
     estimated_dimension_box_count = sum(item.get("box_source") == "estimated" and item.get("box") is not None for item in dimensions)
     low_confidence_dimension_box_count = sum(item.get("box_confidence") in {"low", "unavailable"} for item in dimensions)
+    stored_dimension_count = sum(1 for item in dimensions if item.get("stored"))
     result = {
         "status": "pass" if views else "blocked",
         "stage": "review",
@@ -1693,6 +2277,7 @@ def inspect_drawing_structure(drawing_model, *, paper_size_hint=None, title_bloc
         },
         "view_count": len(views),
         "dimension_count": len(dimensions),
+        "stored_dimension_count": stored_dimension_count,
         "table_count": len(tables),
         "view_outline_count": outline_count,
         "dimension_box_count": dimension_box_count,
@@ -1721,6 +2306,137 @@ def inspect_drawing_structure(drawing_model, *, paper_size_hint=None, title_bloc
         ],
     }
     return result
+
+
+def repair_native_drawing_layout(drawing_model, pdf_path, sw_app=None, max_attempts=3):
+    """Run the bounded layout planner against the live drawing COM object.
+
+    Each observation exports a fresh PDF and re-enumerates the drawing structure.
+    Only a unique projected child view with an axis proven from ``GetBaseView`` and
+    center positions can move.  Views with their own children are refused because
+    ``IView.Position`` can propagate to dependent views; this helper never writes
+    scale, annotation visibility, or entity deletion APIs.
+    """
+    try:
+        from scripts.sw_review import repair_drawing_layout
+    except ImportError:
+        from sw_review import repair_drawing_layout
+    try:
+        target_pdf = Path(pdf_path).expanduser().resolve()
+    except (TypeError, ValueError):
+        return {
+            "status": "blocked", "stage": "preflight", "error_code": "DRAWING_LAYOUT_PDF_PATH_INVALID",
+            "manual_review_required": True,
+        }
+    if target_pdf.suffix.lower() != ".pdf":
+        return {
+            "status": "blocked", "stage": "preflight", "error_code": "DRAWING_LAYOUT_PDF_PATH_INVALID",
+            "manual_review_required": True,
+        }
+    latest = {"structure": None, "exports": 0}
+
+    def inspect_fresh():
+        if not export_sheet_to_pdf(drawing_model, str(target_pdf), sw_app=sw_app):
+            raise RuntimeError("DRAWING_LAYOUT_FRESH_PDF_EXPORT_FAILED")
+        latest["exports"] += 1
+        structure = inspect_drawing_structure(drawing_model)
+        if structure.get("status") != "pass":
+            raise RuntimeError("DRAWING_LAYOUT_FRESH_STRUCTURE_UNAVAILABLE")
+        latest["structure"] = structure
+        return structure
+
+    def apply_native_action(action):
+        if not isinstance(action, dict) or action.get("kind") != "move_view":
+            return {"status": "failed", "error_code": "DRAWING_LAYOUT_ACTION_UNSUPPORTED"}
+        delta = action.get("delta_m") or {}
+        try:
+            dx, dy = float(delta["x"]), float(delta["y"])
+        except (KeyError, TypeError, ValueError):
+            return {"status": "failed", "error_code": "DRAWING_LAYOUT_ACTION_DELTA_INVALID"}
+        if not all(math.isfinite(value) for value in (dx, dy)):
+            return {"status": "failed", "error_code": "DRAWING_LAYOUT_ACTION_DELTA_INVALID"}
+        target_name = str(action.get("target") or "")
+        matching = []
+        for sheet_name in _as_sequence(_safe_member(drawing_model, "GetSheetNames", default=[])):
+            sheet = _safe_member(drawing_model, "GetSheet", sheet_name)
+            for view in _as_sequence(_safe_member(sheet, "GetViews", default=[])):
+                if str(_safe_member(view, "Name", default="") or "") == target_name:
+                    matching.append((str(sheet_name), sheet, view))
+        if len(matching) != 1:
+            return {"status": "failed", "error_code": "DRAWING_LAYOUT_TARGET_NOT_UNIQUE", "target": target_name, "count": len(matching)}
+        sheet_name, sheet, view = matching[0]
+        structure = latest.get("structure") or {}
+        records = [
+            record for record in structure.get("views") or []
+            if str(record.get("sheet") or "") == sheet_name and str(record.get("name") or "") == target_name
+        ]
+        if len(records) != 1:
+            return {"status": "failed", "error_code": "DRAWING_LAYOUT_TARGET_EVIDENCE_UNAVAILABLE", "target": target_name}
+        record = records[0]
+        if (
+            record.get("projection_axis") not in {"horizontal", "vertical"}
+            or not record.get("parent_relation_verified")
+            or not record.get("child_linkage_verified")
+            or int(record.get("child_view_count") or 0) != 0
+        ):
+            return {"status": "failed", "error_code": "DRAWING_LAYOUT_VIEW_RELATION_UNVERIFIED", "target": target_name}
+        current = _view_position(view)
+        if current is None:
+            return {"status": "failed", "error_code": "DRAWING_LAYOUT_VIEW_POSITION_UNAVAILABLE", "target": target_name}
+        # Recheck the live relation, rather than trusting a stale wrapper record.
+        base = _safe_member(view, "GetBaseView") if getattr(view, "GetBaseView", None) is not None else None
+        base_position = _view_position(base)
+        if base is None or base_position is None:
+            return {"status": "failed", "error_code": "DRAWING_LAYOUT_VIEW_RELATION_UNVERIFIED", "target": target_name}
+        live_dx, live_dy = current[0] - base_position[0], current[1] - base_position[1]
+        live_axis = "horizontal" if abs(live_dx) > 1e-6 and abs(live_dy) <= 1e-6 else "vertical" if abs(live_dy) > 1e-6 and abs(live_dx) <= 1e-6 else None
+        if live_axis != record.get("projection_axis"):
+            return {"status": "failed", "error_code": "DRAWING_LAYOUT_VIEW_RELATION_UNVERIFIED", "target": target_name}
+        all_views = _as_sequence(_safe_member(sheet, "GetViews", default=[]))
+        if any(
+            child is not view
+            and str(_safe_member(_safe_member(child, "GetBaseView"), "Name", default="") or "") == target_name
+            for child in all_views
+        ):
+            return {"status": "failed", "error_code": "DRAWING_LAYOUT_VIEW_HAS_CHILDREN", "target": target_name}
+        scale_before = _view_scale_state(view)
+        try:
+            actual = _set_view_center(view, (current[0] + dx, current[1] + dy))
+            rebuild = get_com_member(drawing_model, "EditRebuild3")
+            if rebuild is False:
+                raise RuntimeError("EditRebuild3 returned false")
+        except Exception as exc:
+            return {"status": "failed", "error_code": "DRAWING_LAYOUT_NATIVE_MOVE_FAILED", "target": target_name, "error": str(exc)}
+        scale_after = _view_scale_state(view)
+        if not (
+            _same_scale_ratio(scale_before["scale_ratio"], scale_after["scale_ratio"])
+            and scale_before["use_sheet_scale"] == scale_after["use_sheet_scale"]
+            and scale_before["use_parent_scale"] == scale_after["use_parent_scale"]
+        ):
+            return {"status": "failed", "error_code": "DRAWING_LAYOUT_MOVE_CHANGED_SCALE", "target": target_name}
+        return {
+            "status": "pass", "target": target_name, "sheet": sheet_name,
+            "position_before_m": list(current), "position_after_m": actual,
+            "scale_before": scale_before, "scale_after": scale_after,
+        }
+
+    try:
+        result = repair_drawing_layout(inspect_fresh, apply_native_action, max_attempts=max_attempts)
+    except Exception as exc:
+        return {
+            "status": "blocked", "stage": "inspect", "error_code": "DRAWING_LAYOUT_FRESH_EVIDENCE_FAILED",
+            "error": str(exc), "pdf_path": str(target_pdf), "fresh_pdf_exports": latest["exports"],
+            "manual_review_required": True,
+        }
+    return {
+        **result,
+        "stage": "native_layout_repair",
+        "pdf_path": str(target_pdf),
+        "fresh_pdf_exports": latest["exports"],
+        # Unit tests can only exercise a mock.  A live caller still needs final
+        # visual/release review even if this bounded structural loop converges.
+        "manual_review_required": True,
+    }
 
 
 def auto_insert_center_marks(drawing_model, requirements) -> dict:
@@ -1860,9 +2576,28 @@ def export_sheet_to_pdf(model, output_path, sheet_names=None, sw_app=None):
                 continue
     if sw is None:
         return False
+    # A saved drawing must be activatable before export.  Do not silently
+    # export a different document merely because SolidWorks switched focus.
+    source_path = str(_safe_member(model, "GetPathName", default="") or "")
+    if source_path:
+        try:
+            model = activate_document_verified(sw, model, source_path, expected_type=3)
+        except Exception as exc:
+            print({
+                "event": "pdf_export_activation_failed",
+                "source_path": source_path,
+                "error": str(exc),
+            })
+            return False
     try:
         pdf_data = get_com_member(sw, "GetExportFileData", 1)  # 1 = swExportPDFData
     except Exception:
+        return False
+    try:
+        # A viewer process is not part of export-success evidence.
+        pdf_data.ViewPdfAfterSaving = False
+    except Exception as exc:
+        print({"event": "pdf_export_viewer_option_failed", "error": str(exc)})
         return False
 
     if sheet_names is None:
@@ -1881,11 +2616,22 @@ def export_sheet_to_pdf(model, output_path, sheet_names=None, sw_app=None):
         print(f"PDF 图纸选择失败: {exc}")
         return False
 
+    # SaveAs can otherwise be influenced by the current selection.  This
+    # hygiene does not override an API error.
+    _safe_member(model, "ClearSelection2", True)
     errors = VARIANT(pythoncom.VT_BYREF | pythoncom.VT_I4, 0)
     warnings = VARIANT(pythoncom.VT_BYREF | pythoncom.VT_I4, 0)
     success = model.Extension.SaveAs(str(output), 0, 1, pdf_data, errors, warnings)
-    if not success or int(errors.value):
-        print(f"PDF 导出失败, 错误码: {errors.value}, 警告码: {warnings.value}")
+    save_evidence = {
+        "event": "pdf_export_saveas",
+        "return_bool": bool(success),
+        "error_mask": int(errors.value),
+        "warning_mask": int(warnings.value),
+        "output_path": str(output),
+    }
+    print(save_evidence)
+    if not success or save_evidence["error_mask"]:
+        print(f"PDF 导出失败, 错误码: {save_evidence['error_mask']}, 警告码: {save_evidence['warning_mask']}")
         return False
     if not output.is_file() or output.stat().st_size <= 0:
         return False
@@ -1904,36 +2650,97 @@ def export_sheet_to_pdf(model, output_path, sheet_names=None, sw_app=None):
     return True
 
 
-def setup_current_sheet(drawing_model, template_candidates, *, paper_size="A3", projection="first_angle", require_gbt=True) -> dict:
+def setup_current_sheet(
+    drawing_model,
+    template_candidates,
+    *,
+    paper_size="A3",
+    projection=None,
+    orientation=None,
+    require_gbt=True,
+    preserve_format_notes=True,
+    embedded_format_path=None,
+) -> dict:
     """@brief 按 DrawingSpec 配置当前图纸页并回读基本配置证据。"""
     paper_size = str(paper_size).upper()
-    projection = str(projection).lower()
     if paper_size not in PAPER_SIZES:
         raise ValueError(f"不支持的图幅: {paper_size}")
-    if projection not in {"first_angle", "third_angle"}:
-        raise ValueError("projection 必须是 first_angle 或 third_angle")
-    selection = select_drawing_template(template_candidates, paper_size=paper_size, require_gbt=require_gbt)
-    if not selection["selected"]:
-        return {**selection, "status": "blocked", "stage": "preflight", "configured": False, "retryable": True}
     sheet = _safe_member(drawing_model, "GetCurrentSheet")
     sheet_name = str(_safe_member(sheet, "GetName", default="") or "")
     if not sheet_name:
-        return {**selection, "status": "blocked", "stage": "preflight", "configured": False, "error_code": "DRAWING_CURRENT_SHEET_MISSING"}
+        return {"status": "blocked", "stage": "preflight", "configured": False, "error_code": "DRAWING_CURRENT_SHEET_MISSING"}
+    scale_before = _sheet_scale(sheet)
+    view_scales_before = _sheet_view_scale_states(sheet)
+    original_template = str(_safe_member(sheet, "GetTemplateName", default="") or "")
+    selection = select_drawing_template(template_candidates, paper_size=paper_size, require_gbt=require_gbt)
+    embedded_fallback = None
+    if not selection["selected"] and preserve_format_notes and view_scales_before and embedded_format_path is not None:
+        target = Path(embedded_format_path).expanduser().resolve()
+        if target.is_file():
+            return {
+                **selection, "status": "blocked", "stage": "preflight", "configured": False, "retryable": True,
+                "error_code": "DRAWING_EMBEDDED_FORMAT_OUTPUT_EXISTS", "original_template_path": original_template,
+                "manual_review_required": True,
+            }
+        exported = save_current_sheet_format(drawing_model, target)
+        if exported.get("status") == "pass" and exported.get("saved"):
+            embedded_fallback = {
+                "used": True, "path": exported["path"], "original_template_path": original_template,
+                # An exported filename is not a standards-content inspection.
+                "gbt_content_verified": False,
+            }
+            selection = {
+                **selection, "status": "pass", "selected": exported["path"],
+                "gbt_candidate": False, "gbt_content_verified": False,
+                "embedded_format_fallback": embedded_fallback,
+            }
+        else:
+            return {
+                **selection, "status": "blocked", "stage": "preflight", "configured": False, "retryable": True,
+                "error_code": exported.get("error_code") or "DRAWING_EMBEDDED_FORMAT_EXPORT_FAILED",
+                "original_template_path": original_template, "embedded_format_export": exported,
+                "manual_review_required": True,
+            }
+    if not selection["selected"]:
+        return {**selection, "status": "blocked", "stage": "preflight", "configured": False, "retryable": True, "original_template_path": original_template}
+    scale_block = _setup_scale_preflight(scale_before, view_scales_before)
+    projection, projection_source = _effective_projection(projection, scale_before, view_scales_before)
+    sheet_format = _effective_sheet_format(paper_size, orientation, scale_before, view_scales_before)
+    if scale_block or projection is None or sheet_format is None:
+        blocker = scale_block or {
+            "status": "blocked",
+            "error_code": "DRAWING_SHEET_PROJECTION_UNAVAILABLE" if projection is None else "DRAWING_SHEET_FORMAT_UNAVAILABLE",
+            "message": "当前页已有视图但无法读取投影法或同类别纸张格式；拒绝以默认方向覆盖。",
+        }
+        return {
+            **selection,
+            **blocker,
+            "stage": "preflight",
+            "configured": False,
+            "retryable": True,
+            "sheet_scale_before": scale_before,
+            "view_scales_before": view_scales_before,
+            "projection": projection,
+            "projection_source": projection_source,
+            "orientation": orientation,
+        }
+    scale1 = scale_before["numerator"] if scale_before["numerator"] is not None else 1.0
+    scale2 = scale_before["denominator"] if scale_before["denominator"] is not None else 1.0
     try:
         configured = bool(get_com_member(
             drawing_model,
             "SetupSheet6",
             sheet_name,
-            PAPER_SIZES[paper_size]["code"],
+            sheet_format["paper_size_code"],
             12,
-            1.0,
-            1.0,
+            scale1,
+            scale2,
             projection == "first_angle",
             selection["selected"],
-            0.0,
-            0.0,
+            sheet_format["template_width_m"],
+            sheet_format["template_height_m"],
             "",
-            False,
+            not bool(preserve_format_notes),
             0.0,
             0.0,
             0.0,
@@ -1945,18 +2752,46 @@ def setup_current_sheet(drawing_model, template_candidates, *, paper_size="A3", 
         return {**selection, "status": "failed", "stage": "create", "configured": False, "projection": projection, "error_code": "DRAWING_SHEET_SETUP_FAILED", "error": str(exc)}
     if configured:
         _safe_member(drawing_model, "ForceRebuild3", False)
-    sheet_size = _sheet_dimensions(_safe_member(drawing_model, "GetCurrentSheet")) if configured else None
+    configured_sheet = _safe_member(drawing_model, "GetCurrentSheet") if configured else sheet
+    view_scale_restoration = _restore_view_scale_states(configured_sheet, view_scales_before) if configured else []
+    view_scale_verification = _verify_view_scale_states(configured_sheet, view_scales_before) if configured else []
+    view_scales_preserved = bool(configured) and all(item["status"] == "pass" for item in view_scale_verification)
+    scale_after = _sheet_scale(configured_sheet) if configured else None
+    sheet_scale_preserved = bool(configured) and _same_scale_ratio(
+        [scale_before["numerator"], scale_before["denominator"]],
+        [scale_after["numerator"], scale_after["denominator"]],
+    ) if scale_before["numerator"] is not None else bool(configured)
+    sheet_format_preserved = bool(configured) and _sheet_format_matches(sheet_format, scale_after)
+    verified = configured and view_scales_preserved and sheet_scale_preserved and sheet_format_preserved
+    sheet_size = _sheet_dimensions(configured_sheet) if configured else None
     return {
         **selection,
-        "status": "pass" if configured else "failed",
+        "status": "pass" if verified else "review_required" if configured else "failed",
         "stage": "create",
         "configured": configured,
         "paper_size": paper_size,
         "projection": projection,
+        "projection_source": projection_source,
+        "orientation": sheet_format["orientation"],
+        "orientation_source": sheet_format["orientation_source"],
+        "preserved_existing_format": sheet_format["preserved_existing_format"],
+        "paper_size_code": sheet_format["paper_size_code"],
         "sheet_name": sheet_name,
+        "original_template_path": original_template,
+        "embedded_format_fallback": embedded_fallback,
         "sheet_size": sheet_size,
         "sheet_size_source": sheet_size.get("source") if sheet_size else "paper_size_fallback",
-        "error_code": None if configured else "DRAWING_SHEET_SETUP_FAILED",
+        "sheet_scale_before": scale_before,
+        "sheet_scale_after": scale_after,
+        "sheet_scale_preserved": sheet_scale_preserved,
+        "sheet_format_preserved": sheet_format_preserved,
+        "view_scales_before": view_scales_before,
+        "view_scale_restoration": view_scale_restoration,
+        "view_scale_verification": view_scale_verification,
+        "view_scales_preserved": view_scales_preserved,
+        "preserve_format_notes": bool(preserve_format_notes),
+        "remove_modified_format_notes": not bool(preserve_format_notes),
+        "error_code": None if verified else "DRAWING_SHEET_FORMAT_PRESERVATION_UNVERIFIED" if configured and not sheet_format_preserved else "DRAWING_VIEW_SCALE_PRESERVATION_UNVERIFIED" if configured else "DRAWING_SHEET_SETUP_FAILED",
         "manual_review_required": True,
     }
 
@@ -2036,7 +2871,7 @@ def validate_generic_drawing_generation(spec) -> dict:
     }
 
 
-def generate_drawing_from_spec(drawing_model, spec, source_model_path, template_candidates=None) -> dict:
+def generate_drawing_from_spec(drawing_model, spec, source_model_path, template_candidates=None, embedded_format_path=None) -> dict:
     """@brief 按已校验 DrawingSpec 创建标准工程图结构和制造标注入口。"""
     capability = validate_generic_drawing_generation(spec)
     if capability["status"] != "pass":
@@ -2059,6 +2894,7 @@ def generate_drawing_from_spec(drawing_model, spec, source_model_path, template_
         paper_size=paper_size,
         projection=projection,
         require_gbt=spec.get("standard") == "GB_T",
+        embedded_format_path=embedded_format_path,
     )
     if sheet_setup.get("status") != "pass":
         return {"status": sheet_setup.get("status", "blocked"), "stage": "sheet", "sheetSetup": sheet_setup, "error_code": sheet_setup.get("error_code"), "manual_review_required": True}

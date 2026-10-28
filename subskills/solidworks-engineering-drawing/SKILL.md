@@ -6,6 +6,9 @@ metadata: { "openclaw": { "os": ["win32"], "requires": { "anyBins": ["python", "
 
 # SolidWorks 工程图生成与审视
 
+项目级批量交付、产物生命周期与回归入口见根技能的
+[`references/project-delivery-hardening.md`](../../references/project-delivery-hardening.md)。
+
 本子技能专注二维工程图。它依赖根技能 `solidworks-automation` 提供 SolidWorks COM
 会话、模型、导出和通用几何证据；自身负责 `DrawingSpec v1`、工程图工作流和制造交付审视。
 

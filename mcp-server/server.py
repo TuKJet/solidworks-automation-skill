@@ -23,7 +23,7 @@ import platform
 import sys
 import threading
 import time
-from contextlib import redirect_stdout
+from contextlib import nullcontext, redirect_stdout
 from enum import Enum
 from pathlib import Path
 from typing import Any, Dict, Literal, Optional
@@ -51,6 +51,7 @@ if str(SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPTS_DIR))
 
 from scripts.sw_preflight import missing_com_dependencies, solidworks_installed  # noqa: E402
+from scripts.sw_process import SolidWorksHostBusyError, exclusive_cad_job  # noqa: E402
 from scripts.core.execution import normalize_tool_payload  # noqa: E402
 from artifact_access import ArtifactAccess, MAX_INLINE  # noqa: E402
 
@@ -150,7 +151,9 @@ def _load_automation_modules() -> None:
         "drawing_save_review_previews": review.save_drawing_review_previews,
         "drawing_inspect_bmp_preview": review.inspect_bmp_preview,
         "drawing_inspect_structure": drawing.inspect_drawing_structure,
+        "drawing_repair_native_layout": drawing.repair_native_drawing_layout,
         "drawing_review_artifacts": drawing_review.review_drawing_artifacts,
+        "drawing_delivery_verdict": getattr(drawing_review, "delivery_verdict", None),
         "drawing_load_spec": drawing_spec.load_drawing_spec,
         "drawing_validate_spec": drawing_spec.validate_drawing_spec,
         "SW_MATE_COINCIDENT": assembly.SW_MATE_COINCIDENT,
@@ -191,6 +194,7 @@ mcp = FastMCP(
 )
 
 _sw_lock = threading.RLock()
+_document_context: Dict[str, Any] | None = None
 
 # 单个 SolidWorks 操作的持锁上限。超时意味着上一个操作被模态对话框阻塞，
 # 必须让出控制权给调用方，而不是让整个 server 永久挂起。
@@ -784,6 +788,7 @@ class SolidWorksOpenDocumentInput(BaseInput):
     path: str = Field(..., min_length=1, description="Absolute path to .SLDPRT/.SLDASM/.SLDDRW or importable file.")
     read_only: bool = Field(default=False, description="Open document read-only.")
     silent: bool = Field(default=True, description="Use SolidWorks silent open option.")
+    configuration: Optional[str] = Field(default=None, min_length=1, description="Optional configuration to activate and verify.")
     response_format: ResponseFormat = Field(default=ResponseFormat.JSON, description="Return format.")
 
     @field_validator("path")
@@ -964,6 +969,7 @@ class SolidWorksGenerateDrawingInput(BaseInput):
     output_dir: str = Field(..., min_length=1, description="Directory for SLDDRW, PDF, previews, and reports.")
     drawing_filename: str = Field(default="drawing.slddrw", min_length=1, max_length=120)
     overwrite: bool = Field(default=False, description="Allow replacing this run's requested drawing output.")
+    repair_layout: bool = Field(default=False, description="Run bounded native view-position repair with fresh PDF evidence; unresolved layouts remain review_required.")
     response_format: ResponseFormat = Field(default=ResponseFormat.JSON, description="Return format.")
 
     @field_validator("spec_path")
@@ -1193,7 +1199,39 @@ def _active_model_required():
     model = sw.ActiveDoc or model
     if model is None:
         raise RuntimeError("No active SolidWorks document. Use solidworks_open_document or solidworks_new_document first.")
+    _verify_document_context(sw, model)
     return sw, model
+
+
+def _configuration_name(model) -> str:
+    manager = get_com_member(model, "ConfigurationManager", default=None)
+    active = get_com_member(manager, "ActiveConfiguration", default=None) if manager is not None else None
+    return str(get_com_member(active, "Name", default="") or "")
+
+
+def _bind_document_context(model, configuration=None):
+    global _document_context
+    path = str(get_com_member(model, "GetPathName", default="") or "")
+    doc_type = get_com_member(model, "GetType", default=None)
+    if not path or doc_type is None:
+        raise RuntimeError("无法绑定未保存或类型未知的文档上下文")
+    _document_context = {"path": path, "type": int(doc_type), "configuration": configuration or _configuration_name(model)}
+
+
+def _verify_document_context(sw, model) -> None:
+    """Verify the bound document before an active-document MCP operation."""
+    context = _document_context
+    if not context:
+        return
+    actual_path = str(get_com_member(model, "GetPathName", default="") or "")
+    actual_type = get_com_member(model, "GetType", default=None)
+    if actual_type is None:
+        raise RuntimeError("活动文档类型读取失败，拒绝使用未核实的上下文")
+    if Path(actual_path).expanduser().resolve() != Path(context["path"]).expanduser().resolve() or int(actual_type) != int(context["type"]):
+        raise RuntimeError("活动文档已变化：绑定上下文与当前文档不一致，未执行操作")
+    expected_config = context.get("configuration")
+    if expected_config and _configuration_name(model) != expected_config:
+        raise RuntimeError("活动文档配置已变化：绑定上下文与当前配置不一致，未执行操作")
 
 
 def _active_assembly_required():
@@ -1311,7 +1349,7 @@ def _tool_error(exc: Exception, response_format: ResponseFormat = ResponseFormat
 
 
 def _run_locked(operation, response_format: ResponseFormat, load_automation: bool = True,
-                timeout_seconds: float = DEFAULT_LOCK_TIMEOUT_SECONDS):
+                timeout_seconds: float = DEFAULT_LOCK_TIMEOUT_SECONDS, cad_operation: Optional[bool] = None):
     """
     Run one SolidWorks COM operation under the global lock.
 
@@ -1340,17 +1378,30 @@ def _run_locked(operation, response_format: ResponseFormat, load_automation: boo
     _lock_state["thread"] = threading.current_thread().name
     _lock_state["operation"] = None
     try:
-        if load_automation:
-            _load_automation_modules()
-        _coinitialize()
-        with redirect_stdout(sys.stderr):
-            payload = operation()
+        # Only real COM automation occupies the host-wide mutex.  Headless
+        # tools keep their existing in-process serialization but must not
+        # block a SolidWorks desktop job in another MCP process.
+        cad_job = exclusive_cad_job() if (load_automation if cad_operation is None else cad_operation) else nullcontext()
+        with cad_job:
+            if load_automation:
+                _load_automation_modules()
+            _coinitialize()
+            with redirect_stdout(sys.stderr):
+                payload = operation()
         payload = normalize_tool_payload(payload)
         if payload.get("status") not in {"error", "failed", "fail", "blocked"}:
             refs = _artifact_access().publish(payload)
             if refs:
                 payload["artifact_refs"] = refs
         return _result(payload, response_format)
+    except SolidWorksHostBusyError as exc:
+        return _result({
+            "status": "blocked",
+            "error_code": "SW_HOST_BUSY",
+            "retryable": True,
+            "message": str(exc),
+            "suggestion": "等待其他 SolidWorks 自动化作业完成后重试；当前请求未执行。",
+        }, response_format)
     except Exception as exc:
         return _tool_error(exc, response_format)
     finally:
@@ -1781,7 +1832,7 @@ def solidworks_health_check(params: SolidWorksHealthCheckInput = SolidWorksHealt
             "issues": issues,
         }
 
-    return _run_locked(op, params.response_format, load_automation=False)
+    return _run_locked(op, params.response_format, load_automation=False, cad_operation=params.start_solidworks)
 
 
 def _enumerate_solidworks_windows():
@@ -1921,7 +1972,7 @@ def solidworks_recover(params: SolidWorksRecoverInput = SolidWorksRecoverInput()
         }
 
     return _run_locked(op, params.response_format, load_automation=False,
-                       timeout_seconds=params.probe_timeout_seconds)
+                       timeout_seconds=params.probe_timeout_seconds, cad_operation=True)
 
 
 @mcp.tool(
@@ -1938,8 +1989,10 @@ def solidworks_new_document(params: SolidWorksNewDocumentInput) -> str:
     """Create a new part, assembly, or drawing document from a SolidWorks template."""
 
     def op():
+        global _document_context
         sw, _ = connect_solidworks(wait_seconds=1)
         model = new_document(sw, params.doc_type.value, template_path=params.template_path)
+        _document_context = None
         return {"status": "ok", "document": _model_summary(model)}
 
     return _run_locked(op, params.response_format)
@@ -2658,6 +2711,7 @@ def solidworks_open_document(params: SolidWorksOpenDocumentInput) -> str:
     """Open a SolidWorks document by absolute path and make it available for later MCP tools."""
 
     def op():
+        global _document_context
         sw, _ = connect_solidworks(wait_seconds=1)
         model = open_document(
             sw,
@@ -2666,6 +2720,15 @@ def solidworks_open_document(params: SolidWorksOpenDocumentInput) -> str:
             silent=params.silent,
             raise_on_error=True,
         )
+        if params.configuration:
+            result = activate_configuration(model, params.configuration)
+            if not result or str(result.get("active_configuration") or result.get("configuration") or "") != params.configuration:
+                raise RuntimeError(f"配置激活回读失败: {params.configuration}")
+        actual_type = get_com_member(model, "GetType")
+        actual_path = str(get_com_member(model, "GetPathName") or "")
+        if actual_type is None or not actual_path:
+            raise RuntimeError("打开文档后无法核实路径或类型")
+        _bind_document_context(model, params.configuration)
         return {"status": "ok", "document": _model_summary(model)}
 
     return _run_locked(op, params.response_format)
@@ -2778,16 +2841,28 @@ def solidworks_close_documents(params: SolidWorksCloseDocumentsInput = SolidWork
     """Close the active document or all documents in the current SolidWorks session."""
 
     def op():
+        global _document_context
         sw, model = _active_model_required()
         if params.close_all:
             sw.CloseAllDocuments(bool(params.save_changes))
             # 文档已关闭，其 ISketch 引用必须立即释放；否则常驻进程会一直持有
             # 已关闭文档的 COM 对象，导致 SolidWorks 侧无法释放文档。
             clear_sketch_selection_cache()
+            _document_context = None
             return {"status": "ok", "closed": "all", "save_changes": params.save_changes}
+        path = str(get_com_member(model, "GetPathName") or "")
+        if not path or _document_context and Path(path).resolve() != Path(_document_context["path"]).resolve():
+            raise RuntimeError("拒绝关闭：当前文档没有可核实的唯一完整路径")
         title = get_com_member(model, "GetTitle")
+        same_title = []
+        for candidate in get_com_member(sw, "GetDocuments", default=[]) or []:
+            if str(get_com_member(candidate, "GetTitle", default="") or "") == str(title):
+                same_title.append(str(get_com_member(candidate, "GetPathName", default="") or ""))
+        if sum(bool(item) and Path(item).resolve() == Path(path).resolve() for item in same_title) != 1 or len(same_title) != 1:
+            raise RuntimeError("拒绝关闭：标题不唯一，无法安全解析到完整路径")
         sw.CloseDoc(title)
         clear_sketch_selection_cache(model)
+        _document_context = None
         return {"status": "ok", "closed": title}
 
     return _run_locked(op, params.response_format)
@@ -3026,6 +3101,8 @@ def solidworks_create_configuration(params: SolidWorksConfigurationCreateInput) 
             save=params.save,
         )
         result["document"] = _model_summary(model)
+        if result.get("success") and result.get("configuration"):
+            _bind_document_context(model, result["configuration"])
         return result
 
     return _run_locked(op, params.response_format)
@@ -3048,6 +3125,8 @@ def solidworks_activate_configuration(params: SolidWorksConfigurationActivateInp
             save=params.save,
         )
         result["document"] = _model_summary(model)
+        if result.get("success") and result.get("configuration"):
+            _bind_document_context(model, result["configuration"])
         return result
 
     return _run_locked(op, params.response_format)
@@ -3239,18 +3318,22 @@ def solidworks_generate_drawing(params: SolidWorksGenerateDrawingInput) -> str:
         if not source_path.is_file():
             raise FileNotFoundError(f"DrawingSpec.sourceModel 不存在: {source_path}")
         sw, _active = connect_solidworks(wait_seconds=1, visible=True)
-        source_model = open_document(sw, str(source_path), read_only=False, silent=True, raise_on_error=True)
+        source_model = open_document(sw, str(source_path), read_only=True, silent=True, raise_on_error=True)
         drawing_model = new_document(sw, "drawing")
         generation = drawing_generate_from_spec(
             drawing_model,
             spec,
             str(source_path),
             template_candidates=spec.get("templateCandidates"),
+            embedded_format_path=output_dir / (drawing_path.stem + '_embedded_ai.slddrt'),
         )
         if generation.get("status") in {"blocked", "failed"}:
             return generation
         if not save_document(drawing_model, str(drawing_path)):
             raise RuntimeError(f"工程图保存失败: {drawing_path}")
+        layout_repair = drawing_repair_native_layout(drawing_model, str(output_dir / (drawing_path.stem + '_layout.pdf')), sw_app=sw, max_attempts=3) if params.repair_layout else None
+        if layout_repair and layout_repair.get('history') and not save_document(drawing_model, str(drawing_path)):
+            raise RuntimeError('工程图布局修复后保存失败')
         pdf_ok = drawing_export_sheet_to_pdf(drawing_model, str(pdf_path), sw_app=sw)
         previews = drawing_save_review_previews(
             drawing_model,
@@ -3260,16 +3343,24 @@ def solidworks_generate_drawing(params: SolidWorksGenerateDrawingInput) -> str:
             pdf_path=pdf_path,
         ) if pdf_ok else []
         preview_evidence = [drawing_inspect_bmp_preview(path) for path in previews]
+        final_structure = drawing_inspect_structure(drawing_model)
         geometry_evidence = collect_geometry_measurements(source_model) if spec.get("holeRequirements") else None
         review = drawing_review_artifacts(
             spec,
-            structure=generation.get("structure"),
+            structure=final_structure,
             pdf_path=pdf_path if pdf_ok and pdf_path.is_file() else None,
             preview_evidence=preview_evidence,
             model_evidence=geometry_evidence,
         )
+        if layout_repair and layout_repair.get('status') == 'blocked':
+            review = {**review, 'status': 'blocked', 'manual_review_required': True, 'layout_repair': layout_repair}
+        verdict_fn = globals().get("drawing_delivery_verdict")
+        delivery = verdict_fn(save_ok=True, export_ok=bool(pdf_ok), review=review) if callable(verdict_fn) else {
+            "status": "review_required", "release_ready": False,
+            "manufacturing_evidence": "unknown", "reason": "delivery_verdict unavailable",
+        }
         payload = {
-            "status": review.get("status", "review_required"),
+            "status": delivery["status"],
             "capability": "solidworks-engineering-drawing",
             "sourceModel": str(source_path),
             "outputs": {
@@ -3278,11 +3369,15 @@ def solidworks_generate_drawing(params: SolidWorksGenerateDrawingInput) -> str:
                 "previews": preview_evidence,
             },
             "generation": generation,
+            "final_structure": final_structure,
+            "layout_repair": layout_repair,
             "review": review,
-            "manual_review_required": bool(review.get("manual_review_required", True)),
+            "delivery": delivery,
+            "manual_review_required": bool(delivery.get("manual_review_required", True)),
         }
         report_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
         payload["reportPath"] = str(report_path)
+        _bind_document_context(drawing_model)
         return payload
 
     return _run_locked(op, params.response_format)

@@ -1,6 +1,8 @@
 """批量导出产物证据与文档所有权测试。"""
 from pathlib import Path
 
+import pytest
+
 from scripts import sw_export
 
 
@@ -10,6 +12,9 @@ class FakeModel:
 
     def GetTitle(self):
         return self.title
+
+    def GetType(self):
+        return 1
 
 
 class FakeSolidWorks:
@@ -78,6 +83,7 @@ def test_activate_source_document_verifies_active_path(tmp_path):
             return str(source)
 
     class ActivatingSolidWorks:
+        ActiveDoc = ActiveModel(source.name)
         def ActivateDoc3(self, title, _preferences, _option, _errors):
             assert title == source.name
             return ActiveModel(title)
@@ -102,6 +108,7 @@ def test_activate_source_document_falls_back_to_dynamic_proxy(tmp_path, monkeypa
 
     class GeneratedSolidWorks:
         _oleobj_ = object()
+        ActiveDoc = ActiveModel(source.name)
 
         def ActivateDoc3(self, *_args):
             raise TypeError("int() argument must not be VARIANT")
@@ -125,3 +132,51 @@ def test_activate_source_document_falls_back_to_dynamic_proxy(tmp_path, monkeypa
     )
 
     assert active.GetPathName() == str(source)
+
+
+def test_activate_source_document_rejects_wrong_document_type(tmp_path):
+    source = tmp_path / "part.sldprt"
+    source.write_text("part", encoding="utf-8")
+
+    class ActiveModel(FakeModel):
+        def GetPathName(self):
+            return str(source)
+
+        def GetType(self):
+            return 2
+
+    class ActivatingSolidWorks:
+        ActiveDoc = ActiveModel(source.name)
+        def ActivateDoc3(self, title, _preferences, _option, _errors):
+            return ActiveModel(title)
+
+    with pytest.raises(RuntimeError, match="活动文档类型不一致"):
+        sw_export.activate_document_verified(
+            ActivatingSolidWorks(), ActiveModel(source.name), source, expected_type=1
+        )
+
+
+def test_activate_source_document_uses_active_doc_readback(tmp_path):
+    source = tmp_path / "part.sldprt"
+    wrong = tmp_path / "other.sldprt"
+    source.write_text("part", encoding="utf-8")
+    wrong.write_text("other", encoding="utf-8")
+
+    class Model(FakeModel):
+        def GetPathName(self):
+            return str(source)
+
+    class WrongActive(Model):
+        def GetPathName(self):
+            return str(wrong)
+
+    class ActivatingSolidWorks:
+        ActiveDoc = WrongActive("other.sldprt")
+
+        def ActivateDoc3(self, *_args):
+            return Model("part.sldprt")
+
+    with pytest.raises(RuntimeError, match="活动文档与源路径不一致"):
+        sw_export.activate_document_verified(
+            ActivatingSolidWorks(), Model("part.sldprt"), source, expected_type=1
+        )

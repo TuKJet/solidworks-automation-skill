@@ -96,6 +96,32 @@ def test_context_closes_only_created_documents(monkeypatch):
     assert app.exited is False
 
 
+def test_close_rejects_same_title_different_saved_path(monkeypatch, tmp_path):
+    app = App()
+    owned_path = tmp_path / "owned.sldprt"
+    other_path = tmp_path / "other.sldprt"
+    owned = SimpleNamespace(GetTitle=lambda: "Part1", GetPathName=lambda: str(owned_path))
+    other = SimpleNamespace(GetTitle=lambda: "Part1", GetPathName=lambda: str(other_path))
+    app.docs = [other]
+    monkeypatch.setattr(sw_session, "connect_solidworks", lambda **_: (app, other, {"started_by_cad_studio": False, "process_id": 7}))
+    with sw_session.SolidWorksSession() as session:
+        with pytest.raises(RuntimeError, match="同名异路径"):
+            session.close(model=owned)
+    assert app.closed == []
+
+
+def test_close_unsaved_requires_same_object_identity(monkeypatch):
+    app = App()
+    owned = SimpleNamespace(GetTitle=lambda: "未保存", GetPathName=lambda: "")
+    other = SimpleNamespace(GetTitle=lambda: "未保存", GetPathName=lambda: "")
+    app.docs = [other]
+    monkeypatch.setattr(sw_session, "connect_solidworks", lambda **_: (app, other, {"started_by_cad_studio": False, "process_id": 7}))
+    with sw_session.SolidWorksSession() as session:
+        with pytest.raises(RuntimeError, match="无法确认归属"):
+            session.close(model=owned)
+    assert app.closed == []
+
+
 def test_budget_blocks_creation_without_closing_user_documents(monkeypatch):
     app = App()
     app.docs = [SimpleNamespace(GetTitle=lambda: "用户零件")]

@@ -1,4 +1,5 @@
 """工程图结构复核无 COM 测试。"""
+import math
 from pathlib import Path
 
 import pytest
@@ -13,6 +14,8 @@ from scripts.sw_drawing import (
     insert_dimensions,
     plan_standard_view_layout,
     select_drawing_template,
+    save_current_sheet_format,
+    setup_current_sheet,
     setup_current_sheet_as_a3,
 )
 from scripts.sw_review import review_drawing_layout
@@ -84,6 +87,8 @@ class FakeDrawing:
 def test_auto_arrange_dimensions_calls_official_api_per_view():
     """@brief 每个视图至少两个尺寸时应调用官方 AutoArrange 枚举。"""
     class Annotation:
+        Visible = 1
+
         def __init__(self):
             self.selected = False
 
@@ -142,6 +147,61 @@ def test_auto_arrange_dimensions_calls_official_api_per_view():
     assert result["manual_review_required"] is True
 
 
+def test_auto_arrange_dimensions_selects_only_explicitly_visible_annotations():
+    """@brief hidden/stored/unknown dimensions must never be sent to AlignDimensions."""
+    class Annotation:
+        def __init__(self, visible):
+            self.Visible = visible
+
+        def Select2(self, append, mark):
+            return True
+
+    class Dimension:
+        def __init__(self, visible):
+            self.annotation = Annotation(visible)
+
+        def GetAnnotation(self):
+            return self.annotation
+
+    class View(FakeView):
+        def GetDisplayDimensions(self):
+            return [Dimension(1), Dimension(1), Dimension(3), Dimension(0)]
+
+    class Sheet(FakeSheet):
+        def GetViews(self):
+            return [View()]
+
+    class Extension:
+        def __init__(self):
+            self.calls = []
+
+        def AlignDimensions(self, mode, spacing):
+            self.calls.append((mode, spacing))
+            return True
+
+    class Drawing(FakeDrawing):
+        def __init__(self):
+            self.Extension = Extension()
+
+        def GetSheet(self, _name):
+            return Sheet()
+
+        def ClearSelection2(self, _all):
+            return True
+
+        def ForceRebuild3(self, _top_only):
+            return True
+
+        def GraphicsRedraw2(self):
+            return True
+
+    result = auto_arrange_drawing_dimensions(Drawing())
+
+    assert result["views"][0]["dimension_count"] == 4
+    assert result["views"][0]["visible_dimension_count"] == 2
+    assert result["selected_dimension_count"] == 2
+
+
 def test_inspect_drawing_structure_reports_views_dimensions_and_template():
     result = inspect_drawing_structure(FakeDrawing())
     assert result["status"] == "pass"
@@ -152,6 +212,124 @@ def test_inspect_drawing_structure_reports_views_dimensions_and_template():
     assert result["paper_size"] == "A3"
     assert result["view_outline_count"] == 1
     assert result["dimension_box_count"] == 1
+
+
+def test_inspect_dimensions_keeps_identity_not_value_deduplicated_and_marks_visibility():
+    """@brief 两个相同数值尺寸仍须以 source/config/model identity 分开审查。"""
+    class ModelDimension:
+        def __init__(self, name):
+            self.FullName = name
+            self.SystemValue = 0.025
+
+    class SourceDocument:
+        def GetPathName(self):
+            return r"C:\work\part.sldprt"
+
+    class Dimension:
+        Type2 = 2
+
+        def __init__(self, name, visible):
+            self.model = ModelDimension(name)
+            self.Visible = visible
+
+        def GetText(self, index):
+            return "25" if index == 0 else ""
+
+        def GetAnnotation(self):
+            return self
+
+        def GetBox(self):
+            return (0.02, 0.02, 0.0, 0.03, 0.03, 0.0)
+
+        def GetDimension2(self, index):
+            assert index == 0
+            return self.model
+
+    class View(FakeView):
+        ReferencedConfiguration = "Default"
+
+        def ReferencedDocument(self):
+            return SourceDocument()
+
+        def GetDisplayDimensions(self):
+            return [Dimension("D1@Sketch1", 1), Dimension("D2@Sketch1", 3)]
+
+    class Sheet(FakeSheet):
+        def GetViews(self):
+            return [View()]
+
+    class Drawing(FakeDrawing):
+        def GetSheet(self, _name):
+            return Sheet()
+
+        def GetCurrentSheet(self):
+            return Sheet()
+
+    result = inspect_drawing_structure(Drawing())
+    first, second = result["dimensions"]
+
+    assert first["visibility"] == "visible"
+    assert second["visibility"] == "hidden"
+    assert first["identity"]["canonical_key"] != second["identity"]["canonical_key"]
+    assert first["system_value"] == {
+        "value": 0.025,
+        "unit": "m",
+        "value_mm": 25.0,
+        "value_degrees": None,
+        "type": 2,
+        "source": "IDimension.SystemValue",
+    }
+    assert result["stored_dimension_count"] == 2
+
+
+def test_inspect_dimensions_keeps_unknown_visibility_and_normalises_only_known_view_suffix():
+    """@brief 缺少 IAnnotation.Visible 的 stored model dim 仍为 unknown，且不会截断特征名。"""
+    class ModelDimension:
+        FullName = "D1@FrontFeature@Front"
+        SystemValue = math.pi / 2
+
+    class Dimension:
+        Type2 = 3
+
+        def GetAnnotation(self):
+            return object()
+
+        def GetDimension2(self, _index):
+            return ModelDimension()
+
+        def GetText(self, _index):
+            return "90°"
+
+    class View(FakeView):
+        Name = "Front"
+        ReferencedConfiguration = "Default"
+
+        def GetDisplayDimensions(self):
+            return [Dimension()]
+
+    class Sheet(FakeSheet):
+        def GetViews(self):
+            return [View()]
+
+    class Drawing(FakeDrawing):
+        def GetSheet(self, _name):
+            return Sheet()
+
+        def GetCurrentSheet(self):
+            return Sheet()
+
+    result = inspect_drawing_structure(Drawing())
+    dimension = result["dimensions"][0]
+
+    assert dimension["visibility"] == "unknown"
+    assert dimension["stored"] is True
+    assert result["stored_dimension_count"] == 1
+    assert dimension["identity"]["model_dimension"] == "D1@FrontFeature"
+    assert dimension["identity"]["model_dimension_raw"] == "D1@FrontFeature@Front"
+    assert dimension["identity"]["model_dimension_view_suffix_removed"] is True
+    assert dimension["system_value"]["unit"] == "rad"
+    assert dimension["system_value"]["value_degrees"] == pytest.approx(90.0)
+    assert dimension["system_value"]["value_mm"] is None
 
 
 def test_inspect_drawing_structure_reads_real_bom_type_cells_and_configuration():
@@ -245,6 +423,11 @@ def test_inspect_drawing_structure_maps_blank_projected_orientations_semanticall
         "工程图视图2": "top",
         "工程图视图3": "right",
     }
+    by_name = {item["name"]: item for item in result["views"]}
+    assert by_name["工程图视图2"]["projection_axis"] == "vertical"
+    assert by_name["工程图视图3"]["projection_axis"] == "horizontal"
+    assert by_name["工程图视图1"]["projection_axis"] is None
+    assert by_name["工程图视图1"]["child_view_count"] == 2
 
 
 def test_inspect_drawing_structure_reads_professional_annotation_entities():
@@ -879,6 +1062,348 @@ def test_setup_current_sheet_as_a3_uses_verified_signature(tmp_path):
     assert result["status"] == "pass"
     assert drawing.args[:7] == ("Sheet1", 8, 12, 1.0, 1.0, True, str(template.resolve()))
     assert len(drawing.args) == 17
+
+
+def test_setup_current_sheet_preserves_sheet_and_view_scale_chain(tmp_path):
+    """@brief 换图框不得把 1:2 sheet 或独立投影视图硬改为 1:1。"""
+    template = tmp_path / "a3 - gb.slddrt"
+    template.write_text("gb", encoding="utf-8")
+
+    class View:
+        def __init__(self, name, ratio, use_sheet, use_parent):
+            self.Name = name
+            self.ScaleRatio = ratio
+            self.UseSheetScale = use_sheet
+            self.UseParentScale = use_parent
+
+    class Sheet:
+        def __init__(self):
+            self.views = [View("Front", (1.0, 2.0), 1, 0), View("Top", (2.0, 1.0), 0, 0)]
+
+        def GetName(self):
+            return "Sheet1"
+
+        def GetProperties2(self):
+            return (8, 12, 1.0, 2.0, 1, 0.420, 0.297, 0)
+
+        def GetViews(self):
+            return self.views
+
+    class Drawing:
+        def __init__(self):
+            self.sheet = Sheet()
+            self.args = None
+
+        def GetCurrentSheet(self):
+            return self.sheet
+
+        def SetupSheet6(self, *args):
+            self.args = args
+            return True
+
+        def ForceRebuild3(self, _top_only):
+            return True
+
+    drawing = Drawing()
+    result = setup_current_sheet(drawing, [template])
+
+    assert drawing.args[3:5] == (1.0, 2.0)
+    assert drawing.args[10] is False  # preserve_format_notes=True => do not remove modified notes
+    assert result["sheet_scale_before"]["numerator"] == 1.0
+    assert result["sheet_scale_before"]["denominator"] == 2.0
+    assert result["view_scales_before"][1]["scale_ratio"] == [2.0, 1.0]
+    assert result["view_scales_before"][1]["use_sheet_scale"] == 0
+    assert result["view_scales_before"][1]["use_parent_scale"] == 0
+    assert result["view_scales_preserved"] is True
+
+
+def test_setup_current_sheet_preserves_existing_a4_portrait_format_when_orientation_unspecified(tmp_path):
+    """@brief 已有视图的 A4 纵向页不能因默认 A4 横向枚举被翻转。"""
+    template = tmp_path / "a4 - gb.slddrt"
+    template.write_text("gb", encoding="utf-8")
+
+    class View:
+        Name = "Front"
+        ScaleRatio = (1.0, 1.0)
+        UseSheetScale = 1
+        UseParentScale = 0
+
+    class Sheet:
+        def GetName(self):
+            return "Sheet1"
+
+        def GetProperties2(self):
+            # swDwgPaperA4sizeVertical=7, width=210 mm, height=297 mm.
+            return (7, 12, 1.0, 1.0, 1, 0.210, 0.297, 0)
+
+        def GetViews(self):
+            return [View()]
+
+    class Drawing:
+        def __init__(self):
+            self.args = None
+            self.sheet = Sheet()
+
+        def GetCurrentSheet(self):
+            return self.sheet
+
+        def SetupSheet6(self, *args):
+            self.args = args
+            return True
+
+        def ForceRebuild3(self, _top_only):
+            return True
+
+    drawing = Drawing()
+    result = setup_current_sheet(drawing, [template], paper_size="A4")
+
+    assert result["status"] == "pass"
+    assert drawing.args[1] == 7
+    assert drawing.args[7:9] == (0.210, 0.297)
+    assert result["orientation"] == "portrait"
+    assert result["orientation_source"] == "existing_sheet"
+
+
+def test_save_current_sheet_format_exports_embedded_format_and_verifies_file(tmp_path):
+    target = tmp_path / "embedded-a4.slddrt"
+
+    class Sheet:
+        def GetName(self):
+            return "Sheet1"
+
+        def GetTemplateName(self):
+            return "C:/missing/external-format.slddrt"
+
+        def SaveFormat(self, output_path):
+            Path(output_path).write_text("embedded format", encoding="utf-8")
+            return True
+
+    class Drawing:
+        def GetCurrentSheet(self):
+            return Sheet()
+
+    result = save_current_sheet_format(Drawing(), target)
+
+    assert result["status"] == "pass"
+    assert result["saved"] is True
+    assert target.read_text(encoding="utf-8") == "embedded format"
+
+
+def test_setup_current_sheet_can_explicitly_export_existing_embedded_format_without_claiming_gbt(tmp_path):
+    target = tmp_path / "fresh-exported-format.slddrt"
+
+    class View:
+        Name = "Front"
+        ScaleRatio = (1.0, 1.0)
+        UseSheetScale = 1
+        UseParentScale = 0
+
+    class Sheet:
+        def GetName(self):
+            return "Sheet1"
+
+        def GetProperties2(self):
+            return (8, 12, 1.0, 1.0, 1, 0.420, 0.297, 0)
+
+        def GetViews(self):
+            return [View()]
+
+        def GetTemplateName(self):
+            return "C:/missing/legacy-format.slddrt"
+
+        def SaveFormat(self, output_path):
+            Path(output_path).write_text("embedded", encoding="utf-8")
+            return True
+
+    class Drawing:
+        def __init__(self):
+            self.sheet = Sheet()
+            self.args = None
+
+        def GetCurrentSheet(self):
+            return self.sheet
+
+        def SetupSheet6(self, *args):
+            self.args = args
+            return True
+
+        def ForceRebuild3(self, _top_only):
+            return True
+
+    drawing = Drawing()
+    result = setup_current_sheet(drawing, [], embedded_format_path=target)
+
+    assert result["status"] == "pass"
+    assert drawing.args[6] == str(target.resolve())
+    assert result["original_template_path"] == "C:/missing/legacy-format.slddrt"
+    assert result["embedded_format_fallback"]["used"] is True
+    assert result["gbt_content_verified"] is False
+    assert target.read_text(encoding="utf-8") == "embedded"
+
+
+def test_setup_current_sheet_embedded_fallback_refuses_existing_output_and_blank_sheet(tmp_path):
+    existing = tmp_path / "existing.slddrt"
+    existing.write_text("do not overwrite", encoding="utf-8")
+
+    class View:
+        Name = "Front"
+        ScaleRatio = (1.0, 1.0)
+        UseSheetScale = 1
+        UseParentScale = 0
+
+    class ExistingSheet:
+        def GetName(self):
+            return "Sheet1"
+
+        def GetProperties2(self):
+            return (8, 12, 1.0, 1.0, 1, 0.420, 0.297, 0)
+
+        def GetViews(self):
+            return [View()]
+
+        def SaveFormat(self, _output_path):
+            raise AssertionError("existing output must not be overwritten")
+
+    class BlankSheet(ExistingSheet):
+        def GetViews(self):
+            return []
+
+    class Drawing:
+        def __init__(self, sheet):
+            self.sheet = sheet
+
+        def GetCurrentSheet(self):
+            return self.sheet
+
+    existing_result = setup_current_sheet(Drawing(ExistingSheet()), [], embedded_format_path=existing)
+    blank_result = setup_current_sheet(Drawing(BlankSheet()), [], embedded_format_path=tmp_path / "new.slddrt")
+
+    assert existing_result["status"] == "blocked"
+    assert existing_result["error_code"] == "DRAWING_EMBEDDED_FORMAT_OUTPUT_EXISTS"
+    assert existing.read_text(encoding="utf-8") == "do not overwrite"
+    assert blank_result["status"] == "blocked"
+    assert blank_result["error_code"] == "DRAWING_GBT_TEMPLATE_MISSING"
+
+
+def test_setup_current_sheet_blocks_missing_scale_when_views_exist(tmp_path):
+    """@brief 不能在已有 view 的情况下以 1:1 代替读取失败的 sheet 比例。"""
+    template = tmp_path / "a3 - gb.slddrt"
+    template.write_text("gb", encoding="utf-8")
+
+    class View:
+        Name = "Front"
+        ScaleRatio = (1.0, 2.0)
+
+    class Sheet:
+        def GetName(self):
+            return "Sheet1"
+
+        def GetViews(self):
+            return [View()]
+
+    class Drawing:
+        def SetupSheet6(self, *_args):
+            raise AssertionError("比例未知时不得调用 SetupSheet6")
+
+        def GetCurrentSheet(self):
+            return Sheet()
+
+    result = setup_current_sheet(Drawing(), [template], projection="first_angle")
+
+    assert result["status"] == "blocked"
+    assert result["error_code"] == "DRAWING_SHEET_SCALE_UNAVAILABLE"
+
+
+def test_setup_current_sheet_default_projection_preserves_sheet_property(tmp_path):
+    """@brief 调用者未指定 projection 时回用 GetProperties2[4]，而非默认首角。"""
+    template = tmp_path / "a3 - gb.slddrt"
+    template.write_text("gb", encoding="utf-8")
+
+    class Sheet:
+        def GetName(self):
+            return "Sheet1"
+
+        def GetProperties2(self):
+            return (8, 12, 1.0, 2.0, 0, 0.420, 0.297, 0)
+
+        def GetViews(self):
+            return []
+
+    class Drawing:
+        def __init__(self):
+            self.args = None
+
+        def GetCurrentSheet(self):
+            return Sheet()
+
+        def SetupSheet6(self, *args):
+            self.args = args
+            return True
+
+        def ForceRebuild3(self, _top_only):
+            return True
+
+    drawing = Drawing()
+    result = setup_current_sheet(drawing, [template])
+
+    assert drawing.args[5] is False
+    assert result["projection"] == "third_angle"
+    assert result["projection_source"] == "sheet_properties"
+
+
+def test_setup_current_sheet_never_passes_when_view_scale_restore_cannot_be_verified(tmp_path):
+    """@brief SetupSheet6 改写并拒绝恢复 view 标志时必须停止 pass。"""
+    template = tmp_path / "a3 - gb.slddrt"
+    template.write_text("gb", encoding="utf-8")
+
+    class View:
+        Name = "Front"
+        ScaleRatio = (1.0, 2.0)
+        UseParentScale = 0
+
+        def __init__(self):
+            self._use_sheet_scale = 0
+
+        @property
+        def UseSheetScale(self):
+            return self._use_sheet_scale
+
+        @UseSheetScale.setter
+        def UseSheetScale(self, _value):
+            pass
+
+    class Sheet:
+        def __init__(self):
+            self.view = View()
+
+        def GetName(self):
+            return "Sheet1"
+
+        def GetProperties2(self):
+            return (8, 12, 1.0, 2.0, 1, 0.420, 0.297, 0)
+
+        def GetViews(self):
+            return [self.view]
+
+    class Drawing:
+        def __init__(self):
+            self.sheet = Sheet()
+
+        def GetCurrentSheet(self):
+            return self.sheet
+
+        def SetupSheet6(self, *_args):
+            self.sheet.view._use_sheet_scale = 1
+            return True
+
+        def ForceRebuild3(self, _top_only):
+            return True
+
+    result = setup_current_sheet(Drawing(), [template])
+
+    assert result["status"] == "review_required"
+    assert result["error_code"] == "DRAWING_VIEW_SCALE_PRESERVATION_UNVERIFIED"
+    assert result["view_scale_verification"][0]["status"] == "failed"
 
 
 def test_review_drawing_layout_reports_dimension_and_title_collisions():

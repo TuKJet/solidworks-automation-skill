@@ -6,17 +6,32 @@ from scripts import sw_connect
 
 class FakeModel:
     """@brief 最小文档对象。"""
+    def __init__(self, path=""):
+        self.path = str(path)
+
+    def GetTitle(self):
+        return Path(self.path).name if self.path else "part.sldprt"
+
+    def GetPathName(self):
+        return self.path
+
+    def GetType(self):
+        return 1
 
 
 def test_open_document_reuses_existing_model(tmp_path):
     """@brief 装配体已加载组件时不重复调用 OpenDoc6。"""
     source = tmp_path / "part.sldprt"
     source.write_bytes(b"part")
-    expected = FakeModel()
+    expected = FakeModel(source)
 
     class FakeSolidWorks:
+        ActiveDoc = expected
         def GetOpenDocumentByName(self, path):
             assert Path(path) == source.resolve()
+            return expected
+
+        def ActivateDoc3(self, *_args):
             return expected
 
         def OpenDoc6(self, *_args):
@@ -29,10 +44,11 @@ def test_open_document_falls_back_to_dynamic_proxy(tmp_path, monkeypatch):
     """@brief makepy 拒绝 by-ref VARIANT 时使用动态代理。"""
     source = tmp_path / "part.sldprt"
     source.write_bytes(b"part")
-    expected = FakeModel()
+    expected = FakeModel(source)
 
     class GeneratedSolidWorks:
         _oleobj_ = object()
+        ActiveDoc = expected
 
         def GetOpenDocumentByName(self, _path):
             return None
@@ -40,10 +56,16 @@ def test_open_document_falls_back_to_dynamic_proxy(tmp_path, monkeypatch):
         def OpenDoc6(self, *_args):
             raise TypeError("int() argument must not be VARIANT")
 
+        def ActivateDoc3(self, *_args):
+            return expected
+
     class DynamicSolidWorks:
         def OpenDoc6(self, _path, _doc_type, _options, _configuration, errors, warnings):
             errors.value = 0
             warnings.value = 0
+            return expected
+
+        def ActivateDoc3(self, *_args):
             return expected
 
     monkeypatch.setattr(

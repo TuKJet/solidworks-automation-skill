@@ -2,6 +2,8 @@
 from pathlib import Path
 from types import SimpleNamespace
 from contextlib import nullcontext
+import json
+import zipfile
 
 from scripts import sw_delivery
 
@@ -201,6 +203,70 @@ def test_bom_groups_same_part_and_excludes_marked_component(tmp_path, monkeypatc
     assert report["rows"][0]["part_number"] == "PN-100"
     assert report["review_required"] is True
     assert (tmp_path / "bom.csv").read_text(encoding="utf-8-sig").startswith("item,part_number")
+
+
+def test_hierarchy_bom_keeps_instance_rows_and_unknown_relationships(tmp_path, monkeypatch):
+    class HierarchyComponent(FakeComponent):
+        def __init__(self, *args, parent=None, model_type=1, **kwargs):
+            super().__init__(*args, **kwargs)
+            self.parent = parent
+            self.model_type = model_type
+
+        def GetParent(self):
+            return self.parent
+
+        def GetModelDoc2(self):
+            model = super().GetModelDoc2()
+            model.GetType = lambda: self.model_type
+            return model
+
+    part = tmp_path / "part.sldprt"
+    part.write_text("part", encoding="utf-8")
+    parent = HierarchyComponent(tmp_path / "sub.sldasm", "默认", "sub-1", {}, model_type=2)
+    child = HierarchyComponent(part, "默认", "part-1", {}, parent=parent)
+    assembly_path = tmp_path / "assembly.sldasm"
+    assembly_path.write_text("assembly", encoding="utf-8")
+    model = FakeAssembly(assembly_path, [parent, child])
+    monkeypatch.setattr(sw_delivery, "read_custom_property", fake_property_reader)
+
+    rows = sw_delivery.collect_assembly_bom(model, hierarchy=True)
+
+    assert len(rows) == 2
+    assert {row["component_type"] for row in rows} == {"assembly", "part"}
+    assert all(row["localqty"] == 1 and row["quantity_scope"] == "hierarchy_instance" for row in rows)
+    child_row = next(row for row in rows if row["component"] == "part-1")
+    assert child_row["parent"] == "sub-1"
+    assert child_row["depth"] == 2
+    assert child_row["missing"] is False
+
+
+def test_export_bom_bundle_writes_safe_csv_json_xlsx_and_html(tmp_path):
+    rows = [{
+        "item": 1, "part_number": "=HYPERLINK(\"x\")", "description": "<part>",
+        "material": "待确认", "quantity": 1, "file": "C:/part.sldprt",
+        "configuration": "默认", "component": "part", "excluded_from_bom": False,
+        "quantity_scope": "flat_aggregate_all_levels",
+    }]
+
+    result = sw_delivery.export_bom_bundle(rows, tmp_path)
+
+    assert set(result) == {"csv", "xlsx", "json", "html"}
+    assert "'=HYPERLINK" in (tmp_path / "bom.csv").read_text(encoding="utf-8-sig").splitlines()[1]
+    assert json.loads((tmp_path / "bom.json").read_text(encoding="utf-8"))[0]["part_number"].startswith("=")
+    assert "&lt;part&gt;" in (tmp_path / "bom.html").read_text(encoding="utf-8")
+    with zipfile.ZipFile(tmp_path / "bom.xlsx") as archive:
+        xml = archive.read("xl/worksheets/sheet1.xml").decode("utf-8")
+        assert "inlineStr" in xml
+        assert "HYPERLINK" in xml
+
+
+def test_traceability_requires_real_files_and_never_sums_parent_child(tmp_path):
+    rows = [{'quantity': 1, 'quantity_scope': 'hierarchy_instance'}]
+    result = sw_delivery.build_bom_traceability(rows, model_path='missing.sldasm', drawing_path='missing.slddrw', review_path='missing.json')
+    assert result['status'] == 'review_required'
+    assert result['quantity_total'] is None
+    assert result['release_ready'] is False
+    assert not result['reference_evidence']['model']['exists']
 
 
 def test_pack_and_go_uses_native_api_and_records_outputs(tmp_path):

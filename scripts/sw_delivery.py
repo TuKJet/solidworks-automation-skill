@@ -3,14 +3,16 @@ from __future__ import annotations
 
 import csv
 import ctypes
+import html
 import hashlib
 import json
 import os
 import shutil
 import subprocess
 import sys
+import zipfile
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 
 import pywintypes
 from win32com.client import gencache
@@ -65,12 +67,81 @@ def _property_value(model, configuration_name: str, names: tuple[str, ...]) -> s
     return ""
 
 
-def collect_assembly_bom(model, *, include_excluded: bool = False) -> list[dict[str, Any]]:
-    """收集装配体顶层组件并按文件路径和配置汇总数量。"""
+def _component_type(referenced_model) -> str:
+    try:
+        value = int(get_com_member(referenced_model, "GetType"))
+    except (TypeError, ValueError, AttributeError):
+        return "unknown"
+    return {1: "part", 2: "assembly"}.get(value, "unknown")
+
+
+def _hierarchy_metadata(component, referenced_model) -> dict[str, Any]:
+    """Read relationship metadata without fabricating unavailable hierarchy."""
+    parent = None
+    parent_known = False
+    try:
+        parent = get_com_member(component, "GetParent")
+        parent_known = True  # Successful GetParent returning None identifies top level.
+    except Exception:
+        pass
+    depth: int | str = "unknown"
+    parent_name = ""
+    if parent_known and parent is None:
+        depth = 1
+    elif parent_known:
+        parent_name = str(get_com_member(parent, "Name2") or get_com_member(parent, "GetPathName") or "")
+        depth = 2
+        seen = set()
+        cursor = parent
+        while cursor is not None:
+            identity = str(get_com_member(cursor, 'Name2', default=''))
+            if identity in seen or len(seen) >= 128:
+                depth = 'unknown'
+                break
+            seen.add(identity)
+            try:
+                cursor = get_com_member(cursor, "GetParent")
+            except Exception:
+                cursor = None
+                depth = 'unknown'
+            if cursor is not None:
+                depth += 1
+    path = str(get_com_member(component, "GetPathName") or "")
+    excluded = bool(get_com_member(component, "ExcludeFromBOM"))
+    suppression = get_com_member(component, "GetSuppression", default=None)
+    suppressed = suppression == 0 if suppression is not None else None
+    missing = not bool(path) or not Path(path).is_file()
+    temporary = not bool(path) or path.casefold().startswith("inmemory:") or any(
+        token in path.replace('\\', '/').casefold() for token in ('/temp/', '/tmp/', '/swx'))
+    return {
+        "parent": parent_name,
+        "parent_known": parent_known,
+        "depth": depth,
+        "component_type": _component_type(referenced_model),
+        "localqty": 1,
+        "quantity_scope": "hierarchy_instance",
+        "suppressed": suppressed,
+        "suppression_state": suppression,
+        "lightweight": suppression == 1 if suppression is not None else None,
+        "excluded": excluded,
+        "missing": missing,
+        "temporary": temporary,
+    }
+
+
+def collect_assembly_bom(model, *, include_excluded: bool = False, hierarchy: bool = False) -> list[dict[str, Any]]:
+    """Collect BOM rows.
+
+    The legacy default remains a flat aggregation over SolidWorks' returned
+    ``GetComponents(False)`` set, which may contain all levels; its
+    ``quantity_scope`` says so explicitly. ``hierarchy=True`` preserves one
+    instance row per component and never sums parent and child quantities.
+    """
     if int(get_com_member(model, "GetType")) != 2:
         raise ValueError("BOM 清单只支持装配体文档")
     components = get_com_member(model, "GetComponents", False) or []
     grouped: dict[tuple[str, str], dict[str, Any]] = {}
+    instance_rows: list[dict[str, Any]] = []
     for component in components:
         excluded = bool(get_com_member(component, "ExcludeFromBOM"))
         if excluded and not include_excluded:
@@ -83,6 +154,22 @@ def collect_assembly_bom(model, *, include_excluded: bool = False) -> list[dict[
             grouped[key]["quantity"] += 1
             continue
         referenced_model = get_com_member(component, "GetModelDoc2")
+        if hierarchy:
+            metadata = _hierarchy_metadata(component, referenced_model)
+            row = {
+                "item": 0,
+                "part_number": _property_value(referenced_model, configuration, ("PartNumber", "Part Number", "零件代号", "零件号")) or Path(path).stem or name,
+                "description": _property_value(referenced_model, configuration, ("Description", "描述")),
+                "material": _property_value(referenced_model, configuration, ("Material", "材料")),
+                "quantity": 1,
+                "file": path,
+                "configuration": configuration,
+                "component": name,
+                "excluded_from_bom": excluded,
+                **metadata,
+            }
+            instance_rows.append(row)
+            continue
         part_number = _property_value(
             referenced_model,
             configuration,
@@ -98,7 +185,13 @@ def collect_assembly_bom(model, *, include_excluded: bool = False) -> list[dict[
             "configuration": configuration,
             "component": name,
             "excluded_from_bom": excluded,
+            "quantity_scope": "flat_aggregate_all_levels",
         }
+    if hierarchy:
+        rows = sorted(instance_rows, key=lambda row: (str(row.get("depth")), str(row.get("parent")), str(row.get("part_number")).casefold(), str(row.get("component")).casefold()))
+        for index, row in enumerate(rows, start=1):
+            row["item"] = index
+        return rows
     rows = sorted(grouped.values(), key=lambda row: (row["part_number"].casefold(), row["configuration"].casefold()))
     for index, row in enumerate(rows, start=1):
         row["item"] = index
@@ -121,10 +214,10 @@ def export_assembly_bom_csv(
     rows = collect_assembly_bom(model, include_excluded=include_excluded)
     headers = [
         "item", "part_number", "description", "material", "quantity",
-        "file", "configuration", "component", "excluded_from_bom",
+        "file", "configuration", "component", "excluded_from_bom", "quantity_scope",
     ]
     with target.open("w", newline="", encoding="utf-8-sig") as stream:
-        writer = csv.DictWriter(stream, fieldnames=headers)
+        writer = csv.DictWriter(stream, fieldnames=headers, extrasaction="ignore")
         writer.writeheader()
         writer.writerows(rows)
     after = _file_signature(target)
@@ -143,20 +236,103 @@ def export_assembly_bom_csv(
     }
 
 
+def _csv_safe(value: Any) -> Any:
+    """Prevent spreadsheet formula interpretation without changing JSON truth."""
+    if isinstance(value, str) and value[:1] in {"=", "+", "-", "@"}:
+        return "'" + value
+    return value
+
+
+def _bundle_headers(rows: list[dict[str, Any]]) -> list[str]:
+    preferred = [
+        "item", "part_number", "description", "material", "quantity", "quantity_scope",
+        "localqty", "parent", "parent_known", "depth", "component_type", "component",
+        "file", "configuration", "excluded_from_bom", "excluded", "suppressed", "missing", "temporary",
+    ]
+    keys = {key for row in rows for key in row}
+    return [key for key in preferred if key in keys] + sorted(keys - set(preferred))
+
+
+def _write_inline_xlsx(path: Path, rows: list[dict[str, Any]], headers: list[str]) -> None:
+    """Write a minimal valid XLSX using inlineStr cells and no formula cells."""
+    def cell_ref(column: int, row: int) -> str:
+        value = ""
+        number = column
+        while number:
+            number, remainder = divmod(number - 1, 26)
+            value = chr(65 + remainder) + value
+        return f"{value}{row}"
+
+    def cell(reference: str, value: Any) -> str:
+        if isinstance(value, bool):
+            return f'<c r="{reference}" t="b"><v>{int(value)}</v></c>'
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            return f'<c r="{reference}"><v>{value}</v></c>'
+        text = html.escape("" if value is None else str(value), quote=False)
+        return f'<c r="{reference}" t="inlineStr"><is><t xml:space="preserve">{text}</t></is></c>'
+
+    sheet_rows = ["<row r=\"1\">" + "".join(cell(cell_ref(i, 1), header) for i, header in enumerate(headers, 1)) + "</row>"]
+    for row_number, row in enumerate(rows, 2):
+        sheet_rows.append("<row r=\"%d\">%s</row>" % (row_number, "".join(cell(cell_ref(i, row_number), row.get(header)) for i, header in enumerate(headers, 1))))
+    worksheet = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?><worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetViews><sheetView workbookViewId="0"><pane ySplit="1" topLeftCell="A2" activePane="bottomLeft" state="frozen"/></sheetView></sheetViews><cols><col min="1" max="%d" width="22" customWidth="1"/></cols><sheetData>' % max(1, len(headers)) + ''.join(sheet_rows) + '</sheetData><autoFilter ref="A1:%s"/></worksheet>' % cell_ref(max(1, len(headers)), len(rows) + 1)
+    content_types = "<?xml version=\"1.0\" encoding=\"UTF-8\"?><Types xmlns=\"http://schemas.openxmlformats.org/package/2006/content-types\"><Default Extension=\"rels\" ContentType=\"application/vnd.openxmlformats-package.relationships+xml\"/><Default Extension=\"xml\" ContentType=\"application/xml\"/><Override PartName=\"/xl/workbook.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml\"/><Override PartName=\"/xl/worksheets/sheet1.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml\"/></Types>"
+    workbook = "<?xml version=\"1.0\" encoding=\"UTF-8\"?><workbook xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\" xmlns:r=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships\"><sheets><sheet name=\"BOM\" sheetId=\"1\" r:id=\"rId1\"/></sheets></workbook>"
+    rels = "<?xml version=\"1.0\" encoding=\"UTF-8\"?><Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\"><Relationship Id=\"rId1\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument\" Target=\"xl/workbook.xml\"/></Relationships>"
+    workbook_rels = "<?xml version=\"1.0\" encoding=\"UTF-8\"?><Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\"><Relationship Id=\"rId1\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet\" Target=\"worksheets/sheet1.xml\"/></Relationships>"
+    with zipfile.ZipFile(path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr("[Content_Types].xml", content_types)
+        archive.writestr("_rels/.rels", rels)
+        archive.writestr("xl/workbook.xml", workbook)
+        archive.writestr("xl/_rels/workbook.xml.rels", workbook_rels)
+        archive.writestr("xl/worksheets/sheet1.xml", worksheet)
+
+
+def export_bom_bundle(rows, outroot, *, overwrite=False) -> dict[str, Any]:
+    """Export normalized rows to CSV, static XLSX, JSON, and an HTML index."""
+    normalized = [dict(row) for row in rows or []]
+    target = Path(outroot).expanduser().resolve()
+    target.mkdir(parents=True, exist_ok=True)
+    if not overwrite and any((target / ('bom.' + ext)).exists() for ext in ('csv', 'xlsx', 'json', 'html')):
+        raise FileExistsError('BOM bundle already exists; choose a new run directory')
+    headers = _bundle_headers(normalized)
+    csv_path = target / "bom.csv"
+    with csv_path.open("w", newline="", encoding="utf-8-sig") as stream:
+        writer = csv.DictWriter(stream, fieldnames=headers, extrasaction="ignore")
+        writer.writeheader()
+        writer.writerows({_key: _csv_safe(row.get(_key)) for _key in headers} for row in normalized)
+    json_path = target / "bom.json"
+    json_path.write_text(json.dumps(normalized, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    xlsx_path = target / "bom.xlsx"
+    _write_inline_xlsx(xlsx_path, normalized, headers)
+    html_path = target / "bom.html"
+    header_html = "".join(f"<th>{html.escape(header)}</th>" for header in headers)
+    body_html = "".join("<tr>" + "".join(f"<td>{html.escape('' if row.get(header) is None else str(row.get(header)))}</td>" for header in headers) + "</tr>" for row in normalized)
+    html_path.write_text(f"<!doctype html><meta charset=\"utf-8\"><title>BOM</title><table><thead><tr>{header_html}</tr></thead><tbody>{body_html}</tbody></table>\n", encoding="utf-8")
+    return {"csv": str(csv_path), "xlsx": str(xlsx_path), "json": str(json_path), "html": str(html_path)}
+
+
 def build_bom_traceability(bom_rows, *, model_path="", drawing_path="", review_path="") -> dict[str, Any]:
     """@brief 建立 BOM、模型、工程图和复核报告之间的可追溯关系。"""
     rows = list(bom_rows or [])
+    references = {}
+    for key, value in (('model', model_path), ('drawing', drawing_path), ('review', review_path)):
+        path = Path(value).expanduser() if value else None
+        exists = bool(path and path.is_file() and path.stat().st_size > 0)
+        references[key] = {'path': str(path) if path else None, 'exists': exists, 'sha256': _sha256(path) if exists else None}
     checks = [
         {"id": "bom-not-empty", "status": "pass" if rows else "warning", "message": "BOM 包含组件行" if rows else "BOM 为空，需要确认是否为单零件或读取失败"},
-        {"id": "model-reference", "status": "pass" if model_path else "warning", "message": "已关联模型路径" if model_path else "未提供模型路径"},
-        {"id": "drawing-reference", "status": "pass" if drawing_path else "warning", "message": "已关联工程图路径" if drawing_path else "未提供工程图路径"},
-        {"id": "review-reference", "status": "pass" if review_path else "warning", "message": "已关联复核报告" if review_path else "未提供复核报告"},
+        {"id": "model-reference", "status": "pass" if references["model"]["exists"] else "warning", "message": "已关联模型路径" if model_path else "未提供模型路径"},
+        {"id": "drawing-reference", "status": "pass" if references["drawing"]["exists"] else "warning", "message": "已关联工程图路径" if drawing_path else "未提供工程图路径"},
+        {"id": "review-reference", "status": "pass" if references["review"]["exists"] else "warning", "message": "已关联复核报告" if review_path else "未提供复核报告"},
     ]
     return {
-        "status": "pass" if rows and model_path and drawing_path else "warning",
+        "status": "pass" if rows and all(record['exists'] for record in references.values()) else "review_required",
+        "verification_scope": "file_traceability_only",
+        "reference_evidence": references,
+        "release_ready": False,
         "stage": "review",
         "bom_row_count": len(rows),
-        "quantity_total": sum(int(row.get("quantity") or 0) for row in rows),
+        "quantity_total": None if any(row.get('quantity_scope') == 'hierarchy_instance' for row in rows) else sum(int(row.get("quantity") or 0) for row in rows),
         "model_path": str(model_path or ""),
         "drawing_path": str(drawing_path or ""),
         "review_path": str(review_path or ""),
@@ -211,6 +387,28 @@ def _document_dependency_paths(model, source_path: str) -> list[str]:
             continue
         paths.append(path)
     return paths
+
+def validate_packaged_references(package_root, references, *, reopened_references=None, allow_temporary=False):
+    root = Path(package_root).expanduser().resolve()
+    if reopened_references is None:
+        return {"status":"review_required","release_ready":False,"self_contained":False,"references":[],"missing":[],"external":[],"manufacturing_evidence":"unknown"}
+    expected = {str(Path(str(r.get('path') if isinstance(r, dict) else r)).expanduser().resolve()).casefold() for r in references}
+    rows=[]; missing=[]; external=[]
+    for raw in list(reopened_references):
+        temporary = bool(raw.get("temporary")) if isinstance(raw, dict) else False
+        raw_path = raw.get("path") if isinstance(raw, dict) else raw
+        resolved=Path(str(raw_path)).expanduser().resolve(); exists=resolved.is_file()
+        try: inside=resolved.is_relative_to(root)
+        except AttributeError:
+            try: resolved.relative_to(root); inside=True
+            except ValueError: inside=False
+        rows.append({"reference":str(raw_path),"resolved":str(resolved),"exists":exists,"under_root":inside,"temporary":temporary})
+        if not exists: missing.append(str(resolved))
+        if not inside or (temporary and not allow_temporary): external.append(str(resolved))
+    actual = {row['resolved'].casefold() for row in rows}
+    mismatch = sorted(expected.symmetric_difference(actual))
+    ready=bool(rows) and bool(expected) and not missing and not external and not mismatch
+    return {"status":"pass" if ready else "review_required","release_ready":ready,"self_contained":ready,"references":rows,"missing":missing,"external":external,"reference_set_mismatch":mismatch,"manufacturing_evidence":"unknown", "scope":"reference_integrity_only"}
 
 
 def _optional_com_member(obj, name, *args, default=None):
@@ -1334,4 +1532,133 @@ def pack_and_go(
             "include_suppressed": include_suppressed,
             "flatten": flatten,
         },
+    }
+
+
+def _under_package_root(path: Path, package_root: Path) -> bool:
+    """Return whether an already-resolved path stays under the package root."""
+    try:
+        path.relative_to(package_root)
+        return True
+    except ValueError:
+        return False
+
+
+def _open_document_at_path(sw, path: Path):
+    """Read-only COM query; relocation must not open documents to inspect them."""
+    method = getattr(sw, "GetOpenDocumentByName", None)
+    if method is None:
+        raise RuntimeError("ISldWorks.GetOpenDocumentByName unavailable")
+    return method(str(path))
+
+
+def _write_relocation_journal(path: Path, payload: dict[str, Any]) -> None:
+    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+
+def relocate_copied_references(sw, referencing_copy, replacements: Mapping[str, str], package_root) -> dict[str, Any]:
+    """Relocate references in an offline copied drawing/assembly without touching origins.
+
+    SolidWorks requires the referencing document to be closed for
+    ``ISldWorks.ReplaceReferencedDocument``.  This function therefore never
+    opens documents, rejects any open copy/destination, and finishes only as
+    ``review_required``: a caller must reopen the copy and pass actual
+    dependency evidence to :func:`validate_packaged_references` before release.
+    """
+    root = Path(package_root).expanduser().resolve()
+    copy_path = Path(referencing_copy).expanduser().resolve()
+    errors: list[dict[str, Any]] = []
+    if not root.is_dir():
+        errors.append({"code": "DRAWING_REFERENCE_RELOCATION_PACKAGE_ROOT_MISSING", "package_root": str(root)})
+    if not copy_path.is_file() or not _under_package_root(copy_path, root):
+        errors.append({"code": "DRAWING_REFERENCE_RELOCATION_COPY_OUTSIDE_PACKAGE", "referencing_copy": str(copy_path)})
+    if not isinstance(replacements, Mapping) or not replacements:
+        errors.append({"code": "DRAWING_REFERENCE_RELOCATION_REPLACEMENTS_INVALID"})
+        entries: list[tuple[str, str]] = []
+    else:
+        entries = [(str(old), str(new)) for old, new in replacements.items()]
+    preflight: list[dict[str, Any]] = []
+    for old_raw, new_raw in entries:
+        old_path, new_path = Path(old_raw).expanduser().resolve(), Path(new_raw).expanduser().resolve()
+        record = {"old": str(old_path), "new": str(new_path), "old_sha256": None, "new_sha256": None}
+        if old_path == copy_path or new_path == copy_path or old_path == new_path:
+            errors.append({"code": "DRAWING_REFERENCE_RELOCATION_PATH_COLLISION", **record})
+        if not old_path.is_file() or not new_path.is_file():
+            errors.append({"code": "DRAWING_REFERENCE_RELOCATION_COPY_MISSING", **record})
+        elif old_path.suffix.casefold() != new_path.suffix.casefold():
+            errors.append({"code": "DRAWING_REFERENCE_RELOCATION_EXTENSION_MISMATCH", **record})
+        elif not _under_package_root(new_path, root):
+            errors.append({"code": "DRAWING_REFERENCE_RELOCATION_OUTSIDE_PACKAGE", **record})
+        else:
+            record["old_sha256"] = _sha256(old_path)
+            record["new_sha256"] = _sha256(new_path)
+            if record["old_sha256"] != record["new_sha256"]:
+                errors.append({"code": "DRAWING_REFERENCE_RELOCATION_HASH_MISMATCH", **record})
+        preflight.append(record)
+    if not errors:
+        for checked_path, role in [(copy_path, "referencing_copy"), *[(Path(item["new"]), "replacement_copy") for item in preflight]]:
+            try:
+                if _open_document_at_path(sw, checked_path) is not None:
+                    errors.append({"code": "DRAWING_REFERENCE_RELOCATION_DOCUMENT_OPEN", "role": role, "path": str(checked_path)})
+            except Exception as exc:
+                errors.append({"code": "DRAWING_REFERENCE_RELOCATION_OPEN_STATE_UNCONFIRMED", "role": role, "path": str(checked_path), "error": str(exc)})
+    if errors:
+        return {
+            "status": "blocked", "stage": "preflight", "error_code": "DRAWING_REFERENCE_RELOCATION_PREFLIGHT_FAILED",
+            "errors": errors, "replacements": [], "pending_reopen": True, "release_ready": False,
+            "manual_review_required": True,
+        }
+
+    journal_dir = root / ".reference_relocation_journal"
+    journal_dir.mkdir(parents=True, exist_ok=True)
+    token = hashlib.sha256(str(copy_path).encode("utf-8")).hexdigest()[:16]
+    backup_path = journal_dir / f"{copy_path.name}.{token}.pre_replace.bak"
+    journal_path = journal_dir / f"{copy_path.name}.{token}.json"
+    shutil.copy2(copy_path, backup_path)
+    if not backup_path.is_file() or _sha256(backup_path) != _sha256(copy_path):
+        return {
+            "status": "failed", "stage": "backup", "error_code": "DRAWING_REFERENCE_RELOCATION_BACKUP_FAILED",
+            "replacements": [], "pending_reopen": True, "release_ready": False, "manual_review_required": True,
+        }
+    journal = {
+        "referencing_copy": str(copy_path), "package_root": str(root), "backup_path": str(backup_path),
+        "replacements": preflight, "status": "running", "pending_reopen": True,
+    }
+    _write_relocation_journal(journal_path, journal)
+    applied: list[dict[str, Any]] = []
+    failure = None
+    for record in preflight:
+        try:
+            replaced = bool(sw.ReplaceReferencedDocument(str(copy_path), record["old"], record["new"]))
+        except Exception as exc:
+            replaced = False
+            failure = str(exc)
+        applied.append({**record, "replaced": replaced})
+        if not replaced:
+            failure = failure or "ReplaceReferencedDocument returned False"
+            break
+    if failure is not None:
+        rollback_error = None
+        try:
+            shutil.copy2(backup_path, copy_path)
+            rollback_verified = _sha256(backup_path) == _sha256(copy_path)
+        except Exception as exc:
+            rollback_verified = False
+            rollback_error = str(exc)
+        journal.update({"status": "rolled_back" if rollback_verified else "rollback_failed", "applied": applied, "error": failure, "rollback_verified": rollback_verified, "rollback_error": rollback_error})
+        _write_relocation_journal(journal_path, journal)
+        return {
+            "status": "failed", "stage": "replace", "error_code": "DRAWING_REFERENCE_RELOCATION_API_FAILED",
+            "error": failure, "replacements": applied, "backup_path": str(backup_path), "journal_path": str(journal_path),
+            "rollback_verified": rollback_verified, "pending_reopen": True, "release_ready": False,
+            "manual_review_required": True,
+        }
+    journal.update({"status": "replaced_pending_reopen", "applied": applied})
+    _write_relocation_journal(journal_path, journal)
+    return {
+        "status": "review_required", "stage": "replace", "error_code": "DRAWING_REFERENCE_RELOCATION_REOPEN_REQUIRED",
+        "replacements": applied, "backup_path": str(backup_path), "journal_path": str(journal_path),
+        "rollback_verified": None, "pending_reopen": True, "release_ready": False,
+        "next_step": "Close/reopen the copied referencing document, collect actual dependency paths, then call validate_packaged_references.",
+        "manual_review_required": True,
     }

@@ -65,6 +65,9 @@ def test_inspect_drawing_requires_fresh_pdf(monkeypatch, tmp_path: Path, pdf_ok)
 
 
 def test_failed_overwrite_does_not_publish_stale_pdf(monkeypatch, tmp_path: Path):
+    from scripts.sw_drawing_review import delivery_verdict
+    monkeypatch.setattr(server, 'drawing_delivery_verdict', delivery_verdict, raising=False)
+    monkeypatch.setattr(server, '_bind_document_context', lambda model: None)
     source = tmp_path / "source.sldprt"
     source.touch()
     (tmp_path / "block.pdf").write_bytes(b"old pdf")
@@ -77,6 +80,7 @@ def test_failed_overwrite_does_not_publish_stale_pdf(monkeypatch, tmp_path: Path
         "open_document": lambda *a, **kw: object(),
         "new_document": lambda *a: object(),
         "drawing_generate_from_spec": lambda *a, **kw: {"status": "pass", "structure": {}},
+        "drawing_inspect_structure": lambda *a, **kw: {"status": "pass", "inspection_phase": "after_save_export"},
         "save_document": lambda *a: True,
         "drawing_export_sheet_to_pdf": lambda *a, **kw: False,
         "drawing_save_review_previews": lambda *a, **kw: [],
@@ -89,3 +93,7 @@ def test_failed_overwrite_does_not_publish_stale_pdf(monkeypatch, tmp_path: Path
     assert result["outputs"]["pdf"] == {
         "path": None, "exists": False, "size_bytes": 0, "export_succeeded": False}
     assert (tmp_path / "block.pdf").read_bytes() == b"old pdf"
+    assert result['status'] == 'blocked'
+    assert result['delivery']['export'] == 'fail'
+    assert result['delivery']['release_ready'] is False
+    assert result['final_structure']['inspection_phase'] == 'after_save_export'

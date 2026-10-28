@@ -271,6 +271,9 @@ assert result.ok, result.issues
 
 ## 结果自审查
 
+批量项目交付的 owner/hash/dependency 生命周期与断点续跑约定见
+[`references/project-delivery-hardening.md`](references/project-delivery-hardening.md)。
+
 每次生成、修改、导入或导出 CAD 后都要做自审查，除非用户明确说不需要：
 
 1. 检查 COM 返回值、特征对象、保存/导出返回值和输出文件大小。

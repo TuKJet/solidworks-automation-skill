@@ -196,6 +196,35 @@ class SolidWorksSession:
             if model is None:
                 return False
             title = get_com_member(model, "GetTitle")
+        if model is not None:
+            # CloseDoc 只接受标题；关闭前必须先确认标题仍绑定到本轮目标。
+            # 已保存文档按完整路径比对，禁止同名异路径误关；未保存文档只能
+            # 以同一 COM 对象身份确认，否则宁可拒绝关闭。
+            raw_requested_path = str(get_com_member(model, "GetPathName") or "")
+            requested_path = os.path.normcase(os.path.abspath(raw_requested_path)) if raw_requested_path else ""
+            candidates = list(self._documents())
+            matched = False
+            target_title = str(get_com_member(model, "GetTitle") or title)
+            same_title = []
+            for candidate in candidates:
+                candidate_path = str(get_com_member(candidate, "GetPathName") or "")
+                if str(get_com_member(candidate, "GetTitle") or "") == target_title:
+                    same_title.append(candidate_path)
+                if requested_path:
+                    if candidate_path and os.path.normcase(os.path.abspath(candidate_path)) == requested_path:
+                        matched = True
+                        break
+                elif candidate is model:
+                    matched = True
+                    break
+            if not matched:
+                raise RuntimeError("拒绝关闭：目标文档已不存在或同名异路径，无法确认归属")
+            if len(same_title) != 1:
+                raise RuntimeError("拒绝关闭：标题不唯一，无法安全解析到完整路径")
+        else:
+            same_title = [doc for doc in self._documents() if str(get_com_member(doc, "GetTitle") or "") == str(title)]
+            if len(same_title) != 1:
+                raise RuntimeError("拒绝关闭：标题不唯一，无法安全解析到完整路径")
         is_current_model = False
         if self.model:
             try:

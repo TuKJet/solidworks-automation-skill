@@ -4,7 +4,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from scripts.drawing_spec import validate_drawing_spec
-from scripts.sw_drawing import add_note, generate_drawing_from_spec, plan_standard_view_layout, validate_generic_drawing_generation
+from scripts.sw_drawing import add_note, generate_drawing_from_spec, plan_standard_view_layout, update_notes, validate_generic_drawing_generation
 from scripts.sw_drawing_review import review_drawing_artifacts
 
 
@@ -259,6 +259,9 @@ def test_note_creation_reads_back_text_and_sheet_position():
         def GetPosition(self):
             return self.position
 
+        def GetLeaderStyle(self):
+            return 0
+
     class Note:
         def __init__(self, text):
             self.text = text
@@ -283,6 +286,119 @@ def test_note_creation_reads_back_text_and_sheet_position():
     assert result["verified"] is True
     assert result["text_evidence"] == "Material: ABS"
     assert result["position_evidence_m"] == [0.02, 0.02, 0.0]
+
+
+def test_note_without_leader_readback_cannot_pass():
+    """@brief SetLeader3 void/unsupported is not evidence that a leader is absent."""
+    class Annotation:
+        def __init__(self):
+            self.position = None
+
+        def SetLeader3(self, *_args):
+            return None
+
+        def SetPosition2(self, x, y, z):
+            self.position = (x, y, z)
+            return True
+
+        def GetPosition(self):
+            return self.position
+
+    class Note:
+        def __init__(self, text):
+            self.text, self.annotation = text, Annotation()
+
+        def GetText(self):
+            return self.text
+
+        def GetAnnotation(self):
+            return self.annotation
+
+    class Drawing:
+        def InsertNote(self, text):
+            return Note(text)
+
+    result = add_note(Drawing(), 0.02, 0.02, "unverified leader")
+
+    assert result["leader_disabled"] is None
+    assert result["status"] == "failed"
+    assert result["error_code"] == "DRAWING_NOTE_LEADER_UNVERIFIED"
+
+
+def test_add_note_clears_selection_leaves_template_and_disables_leader():
+    """@brief 普通注释不得继承 template 编辑态或选择集产生的自动 leader。"""
+    class Annotation:
+        def __init__(self):
+            self.position = None
+            self.leader = None
+
+        def SetLeader3(self, *args):
+            self.leader = args
+            return 0
+
+        def SetPosition2(self, x, y, z):
+            self.position = (x, y, z)
+            return True
+
+        def GetPosition(self):
+            return self.position
+
+    class Note:
+        def __init__(self, text):
+            self.text = text
+            self.annotation = Annotation()
+
+        def GetText(self):
+            return self.text.replace("\n", "\r\n")
+
+        def GetAnnotation(self):
+            return self.annotation
+
+    class Drawing:
+        def __init__(self):
+            self.editing_sheet = False
+            self.cleared = False
+            self.note = None
+
+        def GetEditSheet(self):
+            return self.editing_sheet
+
+        def EditSheet(self):
+            self.editing_sheet = True
+
+        def ClearSelection2(self, all_items):
+            self.cleared = all_items
+            return True
+
+        def InsertNote(self, text):
+            assert self.cleared is True
+            self.note = Note(text)
+            return self.note
+
+    drawing = Drawing()
+    result = add_note(drawing, 0.02, 0.02, "line 1\nline 2")
+
+    assert result["status"] == "pass"
+    assert result["leader_disabled"] is True
+    assert drawing.note.annotation.leader[0] == 0
+
+
+def test_update_notes_uses_set_text_and_normalises_newlines_for_verification():
+    class Note:
+        def __init__(self):
+            self.text = "old"
+
+        def SetText(self, text):
+            self.text = text
+            return True
+
+        def GetText(self):
+            return self.text.replace("\n", "\r\n")
+
+    result = update_notes([(Note(), "line 1\nline 2")])
+
+    assert result["status"] == "pass"
+    assert result["updates"][0]["verified"] is True
 
 
 def test_review_requires_dimension_and_layout_evidence():

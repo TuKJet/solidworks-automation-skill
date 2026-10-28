@@ -27,8 +27,49 @@ def _normalise_token(value: Any) -> str:
     return re.sub(r"\s+", "", str(value or "")).casefold()
 
 
+def _normalise_lines(value: Any) -> str:
+    return "\n".join(line.strip() for line in str(value or "").replace("\r\n", "\n").replace("\r", "\n").split("\n")).strip()
+
+
+def _hidden(dimension: Mapping[str, Any]) -> bool:
+    return dimension.get("visibility") in ("hidden", 3) or dimension.get("visible") is False
+
+
+def delivery_verdict(*, save_ok: bool, export_ok: bool, review: Mapping[str, Any],
+                     manufacturing: Mapping[str, Any] | None = None) -> dict[str, Any]:
+    """Separate file creation from readability and engineering release evidence."""
+    readability = review.get("status", "unknown")
+    manufacturing_status = (manufacturing or {}).get("status", "unknown")
+    # A bare assertion of pass is not an engineering approval record.
+    if manufacturing_status == "pass" and not (manufacturing or {}).get("evidence"):
+        manufacturing_status = "unknown"
+    blocked = not save_ok or not export_ok or readability in {"blocked", "fail"}
+    ready = not blocked and readability == "pass" and manufacturing_status == "pass"
+    return {"status": "blocked" if blocked else "pass" if ready else "review_required",
+            "save": "pass" if save_ok else "fail", "export": "pass" if export_ok else "fail",
+            "readability": readability, "manufacturing": manufacturing_status,
+            "release_ready": ready, "manual_review_required": not ready}
+
+
 def _dimension_identity(dimension: Mapping[str, Any]) -> str:
-    """@brief 提取尺寸的稳定标识；D1 与 D10 必须保持不同。"""
+    """@brief 提取回报用的稳定尺寸身份，优先源/配置/模型尺寸规范键。"""
+    canonical = _canonical_dimension_identity(dimension)
+    return canonical or _legacy_dimension_short_id(dimension)
+
+
+def _canonical_dimension_identity(dimension: Mapping[str, Any]) -> str:
+    """Return a structured identity; never manufacture one from a display name."""
+    identity = dimension.get("identity")
+    if isinstance(identity, Mapping):
+        canonical = str(identity.get("canonical_key") or "").strip()
+        if canonical:
+            return canonical
+    explicit = dimension.get("id") or dimension.get("dimension_id")
+    return str(explicit).strip() if explicit else ""
+
+
+def _legacy_dimension_short_id(dimension: Mapping[str, Any]) -> str:
+    """Compatibility-only short ID; callers must establish it is unique."""
     explicit = dimension.get("id") or dimension.get("dimension_id")
     if explicit:
         return str(explicit).strip()
@@ -47,6 +88,39 @@ def _dimension_view(dimension: Mapping[str, Any]) -> str:
 def _dimension_text(dimension: Mapping[str, Any]) -> str:
     """@brief 最终 PDF 回读文字优先于 COM 的空字符串。"""
     return str(dimension.get("rendered_text") or dimension.get("text") or "").strip()
+
+
+# 仅映射本工作流已经以官方 Type2 值读取并有单位证据的类型。``overall``
+# 是图纸表达语义，不能从“这是长度尺寸”推断出来；未知 Type2 必须继续人工复核。
+_TYPE2_SEMANTIC_KINDS = {2: "linear", 3: "angular", 16: "angular"}
+
+
+def _system_value(dimension: Mapping[str, Any]) -> Mapping[str, Any]:
+    value = dimension.get("system_value")
+    return value if isinstance(value, Mapping) else {}
+
+
+def _dimension_number(dimension: Mapping[str, Any], field: str) -> float | None:
+    """@brief 兼容旧顶层字段和新的 system_value 嵌套单位值。"""
+    value = dimension.get(field)
+    if value is None:
+        value = _system_value(dimension).get(field)
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if math.isfinite(number) else None
+
+
+def _dimension_kind(dimension: Mapping[str, Any]) -> str | None:
+    explicit = dimension.get("kind") or dimension.get("semantic_kind")
+    if explicit:
+        return str(explicit)
+    try:
+        dimension_type = int(dimension.get("type2"))
+    except (TypeError, ValueError):
+        return None
+    return _TYPE2_SEMANTIC_KINDS.get(dimension_type)
 
 
 def _extract_numbers(value: Any) -> list[float]:
@@ -71,7 +145,7 @@ def _dimension_mismatches(requirement: Mapping[str, Any], dimension: Mapping[str
         mismatches.append("view")
 
     expected_kind = _normalise_token(requirement.get("kind"))
-    actual_kind = _normalise_token(dimension.get("kind") or dimension.get("semantic_kind"))
+    actual_kind = _normalise_token(_dimension_kind(dimension))
     if expected_kind and actual_kind != expected_kind:
         mismatches.append("kind")
 
@@ -81,11 +155,9 @@ def _dimension_mismatches(requirement: Mapping[str, Any], dimension: Mapping[str
     if "valueMm" in requirement:
         expected_value = float(requirement["valueMm"])
         actual_values = []
-        if dimension.get("value_mm") is not None:
-            try:
-                actual_values.append(float(dimension["value_mm"]))
-            except (TypeError, ValueError):
-                pass
+        system_value_mm = _dimension_number(dimension, "value_mm")
+        if system_value_mm is not None:
+            actual_values.append(system_value_mm)
         rendered_values = _extract_numbers(actual_text)
         if rendered_values:
             actual_values.append(rendered_values[0])
@@ -110,11 +182,23 @@ def _required_dimension_report(spec: Mapping[str, Any], structure: Mapping[str, 
     used: set[int] = set()
     for item in requirements:
         identifier = str(item.get("id") or "").strip()
-        candidates = [
+        canonical_candidates = [
             (index, dimension)
             for index, dimension in enumerate(dimensions)
-            if index not in used and _normalise_token(_dimension_identity(dimension)) == _normalise_token(identifier)
+            if index not in used and _normalise_token(_canonical_dimension_identity(dimension)) == _normalise_token(identifier)
         ]
+        # Old specs commonly name dimensions only as ``D1``.  Preserve that
+        # compatibility only where it resolves to exactly one unconsumed drawing
+        # dimension; a short name must never choose between D1@SketchA/D1@SketchB.
+        if canonical_candidates:
+            candidates = canonical_candidates
+        else:
+            legacy_candidates = [
+                (index, dimension)
+                for index, dimension in enumerate(dimensions)
+                if index not in used and _normalise_token(_legacy_dimension_short_id(dimension)) == _normalise_token(identifier)
+            ]
+            candidates = legacy_candidates if len(legacy_candidates) == 1 else []
         best = None
         for index, dimension in candidates:
             mismatches = _dimension_mismatches(item, dimension)
@@ -264,7 +348,50 @@ def _bom_report(spec: Mapping[str, Any], structure: Mapping[str, Any]) -> dict[s
     ]
     if not tables:
         return {"required": True, "status": "fail", "tables": [], "reason": "missing"}
+    expected_rows = list(bom_spec.get("expectedRows") or bom_spec.get("rows") or [])
+
+    def rows_match_exactly(cells: list[Any]) -> tuple[bool, str | None]:
+        """Match every requested BOM row as one exact row, never scattered cells."""
+        if not expected_rows:
+            return True, None
+        if any(isinstance(row, str) for row in expected_rows):
+            # The old ["P1", "M8"] shape cannot establish whether values came
+            # from the same row or correct columns.
+            return False, "legacy_expected_rows_unstructured"
+        if not cells or not isinstance(cells[0], (list, tuple)):
+            return False, "header_unavailable"
+        headers = [str(cell) for cell in cells[0]]
+        normalized_headers = [_normalise_token(cell) for cell in headers]
+        if not all(normalized_headers) or len(set(normalized_headers)) != len(normalized_headers):
+            return False, "header_ambiguous"
+        rows = [list(row) for row in cells[1:] if isinstance(row, (list, tuple))]
+        for expected in expected_rows:
+            if isinstance(expected, Mapping):
+                expected_cells = {_normalise_token(key): _normalise_token(value) for key, value in expected.items()}
+                if not expected_cells or any(key not in normalized_headers for key in expected_cells):
+                    return False, "expected_header_missing"
+                if not any(
+                    all(
+                        column < len(row) and _normalise_token(row[column]) == value
+                        for key, value in expected_cells.items()
+                        for column in [normalized_headers.index(key)]
+                    )
+                    for row in rows
+                ):
+                    return False, "expected_row_missing"
+            elif isinstance(expected, (list, tuple)):
+                values = [_normalise_token(value) for value in expected]
+                if len(values) != len(normalized_headers) or not any(
+                    len(row) >= len(values) and all(_normalise_token(row[index]) == value for index, value in enumerate(values))
+                    for row in rows
+                ):
+                    return False, "expected_row_missing"
+            else:
+                return False, "expected_rows_invalid"
+        return True, None
+
     usable = []
+    unverified_reason = None
     for table in tables:
         row_count = table.get("row_count")
         if not isinstance(row_count, int) or row_count <= 1:
@@ -275,12 +402,9 @@ def _bom_report(spec: Mapping[str, Any], structure: Mapping[str, Any]) -> dict[s
         requested_configuration = str(bom_spec.get("configuration") or "").strip()
         if requested_configuration and str(table.get("configuration") or "").strip() != requested_configuration:
             continue
-        expected_rows = list(bom_spec.get("expectedRows") or bom_spec.get("rows") or [])
-        flattened_rows = ["|".join(_normalise_token(cell) for cell in row) for row in cells[1:]]
-        if expected_rows and not all(
-            any(_normalise_token(expected) in row for row in flattened_rows)
-            for expected in expected_rows
-        ):
+        exact_rows, reason = rows_match_exactly(cells)
+        if not exact_rows:
+            unverified_reason = unverified_reason or reason
             continue
         usable.append(table)
     return {
@@ -288,7 +412,7 @@ def _bom_report(spec: Mapping[str, Any], structure: Mapping[str, Any]) -> dict[s
         "status": "pass" if usable else "review_required",
         "tables": tables,
         "usable_table_count": len(usable),
-        "reason": None if usable else "content_or_configuration_unverified",
+        "reason": None if usable else unverified_reason or "content_or_configuration_unverified",
     }
 
 
@@ -486,7 +610,7 @@ def _note_report(
         return base
     notes = list((structure or {}).get("notes") or [])
     for text in required:
-        matching = [item for item in notes if str(item.get("text") or "") == text]
+        matching = [item for item in notes if _normalise_lines(item.get("text")) == _normalise_lines(text)]
         if not matching:
             base["missing_structure"].append(text)
         elif not any(item.get("position_m") and len(item["position_m"]) >= 2 for item in matching):
@@ -502,21 +626,35 @@ def _note_report(
     sheet_order = {str(name): index + 1 for index, name in enumerate((structure or {}).get("sheets") or [])}
     used_spans: set[tuple[int, int]] = set()
     for text in required:
-        note_records = [item for item in notes if str(item.get("text") or "") == text]
+        note_records = [item for item in notes if _normalise_lines(item.get("text")) == _normalise_lines(text)]
         sheet = str(note_records[0].get("sheet") or "") if note_records else ""
         expected_page = sheet_order.get(sheet, 1)
         candidates = []
         for page in pdf.get("pages") or []:
             if int(page.get("page", 0)) != expected_page:
                 continue
-            for span_index, span in enumerate(page.get("textSpans") or []):
+            spans = page.get("textSpans") or []
+            lines = _normalise_lines(text).split("\n")
+            for span_index, span in enumerate(spans):
                 if (expected_page, span_index) in used_spans:
                     continue
-                if str(span.get("text") or "").strip() == text:
-                    candidates.append((expected_page, span_index, span))
+                group = spans[span_index:span_index + len(lines)]
+                if len(group) != len(lines) or any((expected_page, span_index + i) in used_spans for i in range(len(lines))):
+                    continue
+                if [_normalise_lines(item.get("text")) for item in group] != lines:
+                    continue
+                # Consecutive PDF records must also form one spatial note, not
+                # unrelated phrases on opposite sides of the page.
+                boxes = [item["bboxPt"] for item in group]
+                if any(abs(b[0] - boxes[0][0]) > 12 or b[1] < a[1] or b[1] - a[3] > 24
+                       for a, b in zip(boxes, boxes[1:])):
+                    continue
+                combined = {"text": text, "bboxPt": [min(b[0] for b in boxes), min(b[1] for b in boxes),
+                                                       max(b[2] for b in boxes), max(b[3] for b in boxes)]}
+                candidates.append((expected_page, span_index, combined))
         if candidates:
             page_number, span_index, span = candidates[0]
-            used_spans.add((page_number, span_index))
+            used_spans.update((page_number, span_index + i) for i in range(len(lines)))
             base["pdf_matches"].append({
                 "text": text,
                 "page": page_number,
@@ -560,6 +698,7 @@ def inspect_pdf_dimension_rendering(
         "collisions": [],
         "error_code": None,
         "manual_review_required": True,
+        "excluded_hidden_count": sum(_hidden(item) for item in dimensions),
     }
     try:
         width_m = float(width_m)
@@ -585,6 +724,11 @@ def inspect_pdf_dimension_rendering(
     sheet_order = {str(name): index for index, name in enumerate(structure.get("sheets") or [])}
     used = set()
     for index, dimension in enumerate(dimensions):
+        if _hidden(dimension):
+            continue
+        if dimension.get("visibility") in ("unknown", 0):
+            base["unmatched_dimension_indexes"].append(index)
+            continue
         evidence = dimension.get("box_evidence") or {}
         position = evidence.get("position_m") or []
         if len(position) < 2:
@@ -608,6 +752,16 @@ def inspect_pdf_dimension_rendering(
         for candidate_index, span in enumerate(page.get("textSpans") or []):
             if (page_index, candidate_index) in used or not span.get("dimensionCandidate"):
                 continue
+            expected_text = str(dimension.get("text") or "").strip()
+            expected_value = _dimension_number(dimension, "value_degrees")
+            if expected_value is None:
+                expected_value = _dimension_number(dimension, "value_mm")
+            if expected_text and _normalise_token(expected_text) != _normalise_token(span.get("text")):
+                continue
+            if expected_value is not None:
+                numbers = _extract_numbers(span.get("text"))
+                if not numbers or not math.isclose(numbers[0], float(expected_value), abs_tol=0.01, rel_tol=0):
+                    continue
             left, top, right, bottom = (float(value) for value in span["bboxPt"])
             center_x = (left + right) / 2.0
             center_y = (top + bottom) / 2.0
@@ -724,6 +878,9 @@ def review_drawing_artifacts(
     checks = []
     findings = list(validation.get("issues") or [])
     structure = structure or {}
+    # Keep hidden entities in inspection evidence, but never use them to satisfy
+    # a visible drawing requirement or to demand rendered text.
+    structure = {**structure, "dimensions": [d for d in structure.get("dimensions") or [] if not _hidden(d)]}
     pdf_dimension_rendering = (
         inspect_pdf_dimension_rendering(pdf_path, structure)
         if pdf_path and structure
@@ -831,9 +988,25 @@ def review_drawing_artifacts(
         })
 
     pdf_report = None
+    pdf_text_evidence_status = "pass"
     if pdf_path:
         pdf_report = inspect_pdf_text_layout(pdf_path)
-        checks.append(_check("drawing-pdf-text-layout", "warning" if pdf_report.get("overlaps") or pdf_report.get("status") == "blocked" else "pass", pdf_report.get("message", "PDF文字边界已检查")))
+        try:
+            text_span_count = int(pdf_report.get("text_span_count") or 0)
+        except (TypeError, ValueError):
+            text_span_count = 0
+        if pdf_report.get("status") == "blocked":
+            pdf_text_evidence_status = "blocked"
+        elif not text_span_count:
+            # inspect_pdf_text_layout deliberately remains review_required for a
+            # non-overlapping PDF; only a zero-span final PDF is insufficient
+            # delivery evidence here.
+            pdf_text_evidence_status = "review_required"
+        checks.append(_check(
+            "drawing-pdf-text-layout",
+            "pass" if pdf_text_evidence_status == "pass" else "fail" if pdf_text_evidence_status == "blocked" else "warning",
+            pdf_report.get("message", "PDF文字边界已检查"),
+        ))
         if pdf_report.get("overlaps"):
             findings.append({"code": "DRAWING_PDF_TEXT_OVERLAP_RISK", "severity": "fail", "overlaps": pdf_report["overlaps"]})
     rendering_status = "pass" if pdf_dimension_rendering.get("status") == "pass" else "warning"
@@ -854,9 +1027,9 @@ def review_drawing_artifacts(
     )
     status = (
         "blocked"
-        if layout.get("status") == "blocked" or rendering_status == "blocked" or note_report["status"] == "blocked" or (pdf_report and pdf_report.get("overlaps"))
+        if layout.get("status") == "blocked" or rendering_status == "blocked" or note_report["status"] == "blocked" or pdf_text_evidence_status == "blocked" or (pdf_report and pdf_report.get("overlaps"))
         else "review_required"
-        if fail_findings or semantic_review_required or layout.get("status") != "pass" or rendering_status != "pass" or validation["status"] == "pilot"
+        if fail_findings or semantic_review_required or pdf_text_evidence_status != "pass" or layout.get("status") != "pass" or rendering_status != "pass" or validation["status"] == "pilot"
         else "pass"
     )
     return {
@@ -878,6 +1051,6 @@ def review_drawing_artifacts(
         "pdf_evidence": pdf_report,
         "pdf_dimension_rendering": pdf_dimension_rendering,
         "manual_review_required": status != "pass",
-        "error_code": "DRAWING_REVIEW_FINDINGS" if fail_findings else "DRAWING_SEMANTIC_EVIDENCE_INCOMPLETE" if semantic_review_required else pdf_dimension_rendering.get("error_code") if rendering_status != "pass" else layout.get("error_code"),
+        "error_code": "DRAWING_REVIEW_FINDINGS" if fail_findings else "DRAWING_SEMANTIC_EVIDENCE_INCOMPLETE" if semantic_review_required else pdf_report.get("error_code") if pdf_text_evidence_status != "pass" and pdf_report else pdf_dimension_rendering.get("error_code") if rendering_status != "pass" else layout.get("error_code"),
         "capability_level": "pilot",
     }

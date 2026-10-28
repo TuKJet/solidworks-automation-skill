@@ -7,10 +7,10 @@ from pathlib import Path
 
 try:
     from .sw_preflight import import_com_dependencies
-    from .sw_connect import create_empty_dispatch_variant, get_com_member, open_document
+    from .sw_connect import activate_document_verified, create_empty_dispatch_variant, get_com_member, open_document
 except ImportError:
     from sw_preflight import import_com_dependencies
-    from sw_connect import create_empty_dispatch_variant, get_com_member, open_document
+    from sw_connect import activate_document_verified, create_empty_dispatch_variant, get_com_member, open_document
 
 pythoncom, _win32com, VARIANT = import_com_dependencies()
 
@@ -203,34 +203,7 @@ def _file_signature(path):
 
 def _activate_source_document(sw, model, source_path):
     """@brief 激活并回读源文档，防止 STL 等导出器误用当前活动装配体。"""
-    title = str(get_com_member(model, "GetTitle") or "")
-    if not title:
-        raise RuntimeError("源文档没有可激活的标题")
-    errors = VARIANT(pythoncom.VT_BYREF | pythoncom.VT_I4, 0)
-    try:
-        active = sw.ActivateDoc3(title, False, 0, errors)
-    except TypeError:
-        ole_object = getattr(sw, "_oleobj_", None)
-        if ole_object is None:
-            raise
-        dynamic_sw = _win32com.dynamic.DumbDispatch(ole_object, "SldWorks.Application")
-        active = dynamic_sw.ActivateDoc3(title, False, 0, errors)
-    except Exception:
-        try:
-            sw.ActivateDoc2(title, False, errors)
-        except TypeError:
-            ole_object = getattr(sw, "_oleobj_", None)
-            if ole_object is None:
-                raise
-            dynamic_sw = _win32com.dynamic.DumbDispatch(ole_object, "SldWorks.Application")
-            dynamic_sw.ActivateDoc2(title, False, errors)
-        active = get_com_member(sw, "ActiveDoc")
-    if active is None:
-        raise RuntimeError(f"SolidWorks 无法激活源文档: {source_path}")
-    active_path = str(get_com_member(active, "GetPathName") or "")
-    if not active_path or Path(active_path).resolve() != Path(source_path).resolve():
-        raise RuntimeError(f"活动文档与导出源不一致: active={active_path}, source={source_path}")
-    return active
+    return activate_document_verified(sw, model, source_path)
 
 
 def _export_for_format(model, output_path, extension, stl_quality):
