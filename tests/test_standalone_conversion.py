@@ -406,6 +406,25 @@ def test_dxf_preference_restore_failure_stops_batch(tmp_path, runtime):
     assert len(result['not_converted'])==1
 
 
+def test_rendered_annotation_repair_runs_before_dxf_and_is_reported(tmp_path, runtime):
+    src = part(tmp_path)
+    order = []
+    runtime["workflow"]._MODULE = runtime["workflow"]
+    def repair(drawing, sw_app, workflow, pdf_path, **kwargs):
+        assert drawing is runtime["state"].drawings[-1]
+        assert workflow is runtime["workflow"]
+        assert Path(pdf_path).is_file()
+        order.append("repair")
+        original_dxf = runtime["export_dxf"]
+        runtime["export_dxf"] = lambda *args, **kw: (order.append("dxf") or original_dxf(*args, **kw))
+        return {"status": "review_required", "moves": [], "before_count": 1, "after_count": 0, "unresolved": []}
+    runtime["repair_rendered_collisions"] = repair
+    result = cli.convert_one(src, options(tmp_path, src), runtime=runtime)
+    assert result["rendered_annotation_repair"]["after_count"] == 0
+    assert order == ["repair", "dxf"]
+    assert Path(result["report"]).parent.joinpath("rendered_annotation_repair.json").is_file()
+
+
 def test_layout_retry_selects_improvement_and_preserves_failed_candidate(tmp_path, monkeypatch):
     from copy import deepcopy
     dimensions=[{'identity':{'source':'p','configuration':'Default','canonical_key':'p|Default|D1'},
@@ -426,3 +445,34 @@ def test_layout_retry_selects_improvement_and_preserves_failed_candidate(tmp_pat
     assert final['dimensions']==dimensions
     generation=json.loads((tmp_path/'out'/'generation_ai.json').read_text())
     assert generation['layout']['scale']==5.0
+
+
+def test_rendered_controller_exception_prevents_dxf_and_success_outputs(tmp_path,runtime):
+    src=tmp_path/'part.sldprt';src.write_bytes(b'source')
+    runtime['workflow']._MODULE=runtime['workflow']
+    def fail(*args,**kwargs):
+        raise RuntimeError('rollback not verified')
+    runtime['repair_rendered_collisions']=fail
+    runtime['export_dxf']=lambda *a,**k:pytest.fail('DXF must not run after unverified rollback')
+    result=cli.convert_one(src,options(tmp_path,src),runtime=runtime)
+    assert result['status']=='blocked'
+    assert result['error_code']=='DRAWING_RENDERED_REPAIR_UNVERIFIED'
+    assert result['outputs']=={}
+    assert result['source_unchanged']
+
+
+def test_layout_retry_rejects_improved_pdf_with_blocked_native_repair(tmp_path,monkeypatch):
+    from copy import deepcopy
+    dimensions=[{'identity':{'source':'p','configuration':'Default','canonical_key':'p|Default|D1'},
+                 'system_value':{'value':.02,'unit':'m','type':2},'visibility':'visible'}]
+    calls=[]
+    def attempt(session,source,configuration,spec,template,root,stem,runtime):
+        calls.append(spec);root.mkdir(exist_ok=True)
+        return {'save':True,'export':True,'outputs':{'pdf':str(root/'part.pdf')},
+                'generation':{'layout':{'scale':5}},'structure':{'dimensions':deepcopy(dimensions)},
+                'rendered_annotation_repair':{'status':'blocked'},
+                'review':{'pdf_dimension_rendering':{'collisions':[{'first':'D1','second':'D2'}] if len(calls)==1 else [],'matched':[{'dimension_index':0}]}},'spec':spec}
+    monkeypatch.setattr(cli,'_drawing_attempt',attempt)
+    result=cli._drawing_with_layout_retries(None,None,None,{'paperSize':'A3'},None,tmp_path/'out','part',{},2)
+    assert result['selected_layout_attempt']==1
+    assert result['layout_attempts'][1]['accepted'] is False

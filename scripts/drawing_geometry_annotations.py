@@ -83,6 +83,16 @@ def collect_visible_circles(drawing, sw_app, workflow):
                     stage = "GetCurve"
                     curve = get(edge, "GetCurve")
                     if not get(curve, "IsCircle", default=False):
+                        from .drawing_projected_cylinders import circle_from_cylindrical_boundary
+                        projected = circle_from_cylindrical_boundary(edge, transform, workflow)
+                        if projected:
+                            center = projected["center_sheet_m"]
+                            key = (name, round(center[0], 8), round(center[1], 8), round(projected["radius_m"], 10))
+                            if key not in seen:
+                                seen.add(key)
+                                record = {"sheet": sheet_name, "view": name, "semantic_view": semantics.get(name, ""), **projected}
+                                circles.append(record)
+                                handles.append((record, edge, view))
                         continue
                     params = get(curve, "CircleParams", default=[])
                     limits = get(edge, "GetCurveParams2", default=[])
@@ -209,14 +219,24 @@ def repair_generated_annotations(drawing, sw_app, workflow):
         if value.get("type") != 6 or value.get("value") is None or not math.isclose(value["value"], diameter, rel_tol=1e-8, abs_tol=1e-10):
             raise AnnotationRepairError("Native diameter does not equal the selected circular edge")
         annotation = get(dd, "GetAnnotation")
-        if get(annotation, "Visible") != 1:
-            raise AnnotationRepairError("Created diameter is not visible")
+        if (get(annotation, "Visible") != 1 or get(annotation, "IsDangling") is not False
+                or (get(annotation, "GetAttachedEntityCount3") or 0) < 1):
+            raise AnnotationRepairError("Created diameter is not visible and attached")
         identity = workflow._dimension_identity(view, dd, dim)
         entry = {**circle, "status": "added_and_value_verified", "identity": identity,
                  "system_value": value, "text_position_m": [x, y, 0.]}
         added.append(entry)
         coverage.append(entry)
         covered.append(diameter)
+    imported_profile = {"status": "skipped", "reason": "EXISTING_MODEL_DIMENSIONS"}
+    shell_thickness = {"status": "skipped"}
+    if not before["dimensions"]:
+        if any(circle.get("projected_cylinder_boundary") for circle in geometry["circles"]):
+            from .drawing_projected_cylinders import add_cylindrical_shell_thickness
+            shell_thickness = add_cylindrical_shell_thickness(drawing, sw_app, workflow)
+        elif not added:
+            from .drawing_profile_annotations import repair_imported_profile_annotations
+            imported_profile = repair_imported_profile_annotations(drawing, sw_app, workflow)
     drawing.ClearSelection2(True)
     workflow._safe_member(drawing, "ForceRebuild3", False)
     arrangement = workflow.auto_arrange_drawing_dimensions(drawing, spacing_m=.012)
@@ -246,12 +266,18 @@ def repair_generated_annotations(drawing, sw_app, workflow):
                    and d["system_value"] == added_dimension["system_value"]]
         if len(matches) != 1:
             raise AnnotationRepairError("Created diameter identity/value/visibility changed during arrangement")
+    for item in list(shell_thickness.get("added") or []) + list((imported_profile.get("insertion") or {}).get("results") or []):
+        if item.get("status") == "blocked":
+            continue
+        if len([d for d in visible if d["identity"] == item.get("identity") and d["system_value"] == item.get("system_value")]) != 1:
+            raise AnnotationRepairError("Created profile dimension changed during final arrangement")
     missing = [r for r in coverage if r["status"] == "missing"]
-    return {"status": "blocked" if missing or unresolved or spacing["unresolved"] else "review_required",
+    return {"status": "blocked" if missing or unresolved or spacing["unresolved"] or imported_profile.get("status") == "blocked" or shell_thickness.get("status") == "blocked" else "review_required",
             "stored_before": len(before["dimensions"]), "stored_after": len(final["dimensions"]),
             "visible_before": sum(d["visibility"] == "visible" for d in before["dimensions"]),
             "visible_after": len(visible), "duplicates": plan, "geometry": geometry,
             "added_diameters": added, "diameter_coverage": coverage,
             "missing_diameters": missing, "unresolved_duplicates": unresolved, "arrangement": arrangement,
             "cross_view_spacing": spacing,
+            "imported_profile": imported_profile, "shell_thickness": shell_thickness,
             "scope": "Diameter-value coverage only; hole quantity, location, depth and tolerances require separate evidence"}

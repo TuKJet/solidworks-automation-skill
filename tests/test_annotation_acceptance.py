@@ -43,3 +43,13 @@ def test_part_geometry_errors_block_but_assembly_unsupported_is_review_warning()
     spec["documentType"] = "assembly"
     repair["geometry"]["circles"] = []
     assert evaluate_annotation_acceptance(spec, structure, repair, review)["status"] == "review_required"
+
+
+def test_partial_imported_profile_or_missing_shell_measurements_block_even_with_diameters():
+    spec,structure,repair,review=base()
+    repair['geometry']['circles']=[]
+    for key in ('imported_profile','shell_thickness'):
+        partial={**repair,key:{'status':'blocked','reason':'missing_native_measurement'}}
+        result=evaluate_annotation_acceptance(spec,structure,partial,review)
+        assert result['status']=='blocked'
+        assert any(i['code'] in ('DRAWING_IMPORTED_PROFILE_INCOMPLETE','DRAWING_CYLINDRICAL_SHELL_INCOMPLETE') for i in result['issues'])

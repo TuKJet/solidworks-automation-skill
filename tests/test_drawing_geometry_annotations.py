@@ -163,7 +163,7 @@ class FakeDimension:
         self.model = SimpleNamespace(FullName=key, Tolerance=SimpleNamespace(Type=1))
         self.type2 = type2
         self.value = value
-        self.annotation = SimpleNamespace(Visible=visible)
+        self.annotation = SimpleNamespace(Visible=visible, IsDangling=False, GetAttachedEntityCount3=lambda: 1)
 
     def GetAnnotation(self):
         return self.annotation

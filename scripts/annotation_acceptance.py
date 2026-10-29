@@ -32,6 +32,11 @@ def evaluate_annotation_acceptance(spec, structure, repair, review):
         blockers.append(_issue("DRAWING_CIRCULAR_DIAMETERS_MISSING", "存在未覆盖的真实圆边直径。", missing=repair["missing_diameters"]))
     if repair.get("unresolved_duplicates"):
         blockers.append(_issue("DRAWING_DUPLICATES_UNRESOLVED", "存在未解决的重复尺寸。", duplicates=repair["unresolved_duplicates"]))
+    profile = repair.get("imported_profile") or {}
+    if profile.get("status") == "blocked":
+        blockers.append(_issue("DRAWING_IMPORTED_PROFILE_INCOMPLETE", "导入实体的轮廓尺寸补标未完成。", profile=profile))
+    if (repair.get("shell_thickness") or {}).get("status") == "blocked":
+        blockers.append(_issue("DRAWING_CYLINDRICAL_SHELL_INCOMPLETE", "圆柱壳厚度或曲率补标未完成。", shell=repair["shell_thickness"]))
     if (repair.get("cross_view_spacing") or {}).get("unresolved"):
         blockers.append(_issue("DRAWING_CROSS_VIEW_SPACING_UNRESOLVED", "跨视图标注间距风险尚未解决。", unresolved=repair["cross_view_spacing"]["unresolved"]))
 

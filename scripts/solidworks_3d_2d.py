@@ -154,12 +154,14 @@ def _load_runtime():
     from scripts.sw_export import export_drawing_to_dxf_detailed
     from scripts.dxf_validation import validate_dxf_file
     from scripts.drawing_geometry_annotations import repair_generated_annotations
+    from scripts.drawing_rendered_repair import repair_rendered_dimension_collisions
     return {"workflow": workflow, "review_drawing_artifacts": review.review_drawing_artifacts,
             "delivery_verdict": review.delivery_verdict, "get_com_member": get_com_member,
             "activate_configuration": activate_configuration, "exclusive_cad_job": exclusive_cad_job,
             "SolidWorksSession": SolidWorksSession, "export_dxf": export_drawing_to_dxf_detailed,
             "validate_dxf": validate_dxf_file, "implementation_fingerprint": implementation_fingerprint(),
-            "repair_annotations": lambda drawing, sw_app: repair_generated_annotations(drawing, sw_app, workflow._MODULE)}
+            "repair_annotations": lambda drawing, sw_app: repair_generated_annotations(drawing, sw_app, workflow._MODULE),
+            "repair_rendered_collisions": repair_rendered_dimension_collisions}
 
 
 def _configuration(model, get):
@@ -254,6 +256,23 @@ def _drawing_attempt(session, source, configuration, spec, template, root, stem,
         _json_write(root / "generation_ai.json", generated)
         save_ok = bool(session.save(drawing, str(drawing_path)))
         export_ok = save_ok and bool(workflow.export_sheet_to_pdf(drawing, str(pdf_path), sw_app=session.sw))
+        rendered_repair = {"status": "not_requested"}
+        repair_fn = runtime.get("repair_rendered_collisions")
+        if export_ok and repair_fn is not None:
+            try:
+                rendered_repair = repair_fn(
+                    drawing, session.sw, workflow._MODULE, pdf_path,
+                    save_callback=lambda model: session.save(model, str(drawing_path)),
+                    export_callback=lambda model, path: workflow.export_sheet_to_pdf(model, str(path), sw_app=session.sw),
+                    title_block_box=(generated.get("layout") or {}).get("title_block_box"),
+                    evidence_dir=root / "rendered_annotation_repair",
+                )
+            except Exception as error:
+                rendered_repair = {"status": "blocked", "error_code": type(error).__name__, "error": str(error),
+                                   "moves": [], "unresolved": [{"reason": "controller_exception", "error": str(error)}]}
+                _json_write(root / "rendered_annotation_repair.json", rendered_repair)
+                raise ConversionBlocked("DRAWING_RENDERED_REPAIR_UNVERIFIED", str(error)) from error
+        _json_write(root / "rendered_annotation_repair.json", rendered_repair)
         structure = workflow.inspect_drawing_structure(drawing, paper_size_hint=spec["paperSize"], title_block_box=(generated.get("layout") or {}).get("title_block_box"))
         _json_write(root / "drawing_structure_ai.json", structure)
         dxf_path = root / f"{stem}.dxf"
@@ -275,9 +294,10 @@ def _drawing_attempt(session, source, configuration, spec, template, root, stem,
             review.setdefault("findings", []).extend({**issue, "severity": "fail"} for issue in acceptance["issues"])
             review["status"] = "blocked"
         verdict = runtime["delivery_verdict"](save_ok=save_ok, export_ok=export_ok, review=review, manufacturing={"status": "unknown"})
-        status = "blocked" if dxf["status"] == "blocked" or annotation_repair["status"] == "blocked" else verdict["status"]
+        status = "blocked" if dxf["status"] == "blocked" or annotation_repair["status"] == "blocked" or rendered_repair.get("status") == "blocked" else verdict["status"]
         return {"generation": generated, "view_configurations": views, "annotation_acceptance": acceptance,
                 "status": status, "save": save_ok, "export": export_ok, "review": review, "delivery": verdict, "dxf": dxf,
+                "rendered_annotation_repair": rendered_repair,
                 "outputs": {"slddrw": str(drawing_path) if save_ok else None, "pdf": str(pdf_path) if export_ok else None,
                             "dxf": str(dxf_path) if dxf["status"] in {"pass", "review_required"} else None},
                 "structure": structure, "spec": spec}
@@ -297,7 +317,7 @@ def _drawing_with_layout_retries(session, source, configuration, spec, template,
             attempt_root = root / f"layout_attempt_{index:02d}"
             try:
                 candidate = _drawing_attempt(session, source, configuration, candidate_spec, template, attempt_root, stem, runtime)
-                accepted = candidate["save"] and candidate["export"] and candidate.get("dxf", {}).get("status") != "blocked" and accept_candidate(
+                accepted = candidate["save"] and candidate["export"] and candidate.get("dxf", {}).get("status") != "blocked" and candidate.get("rendered_annotation_repair", {}).get("status") != "blocked" and accept_candidate(
                     best["structure"], candidate["structure"], best["review"], candidate["review"])
                 history.append({"attempt": index, "accepted": accepted, "outputs": candidate["outputs"],
                                 "metrics": quality_metrics(candidate["structure"], candidate["review"])})
