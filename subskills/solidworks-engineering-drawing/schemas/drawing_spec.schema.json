@@ -13,6 +13,14 @@
     "paperSize": { "enum": ["A4", "A3", "A2", "A1", "A0"] },
     "modelSizeMm": { "type": "array", "minItems": 3, "maxItems": 3, "items": { "type": "number", "exclusiveMinimum": 0 } },
     "insertModelDimensions": { "type": "boolean" },
+    "layoutOptions": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "viewGapMm": { "type": "number", "minimum": 10, "maximum": 80 },
+        "marginMm": { "type": "number", "minimum": 12, "maximum": 50 }
+      }
+    },
     "templateCandidates": { "type": "array", "items": { "type": "string" } },
     "views": {
       "type": "object",
@@ -50,6 +58,7 @@
       "properties": {
         "slddrw": { "type": "boolean" },
         "pdf": { "type": "boolean" },
+        "dxf": { "type": "boolean" },
         "bmp": { "type": "boolean" },
         "png": { "type": "boolean" },
         "report": { "type": "boolean" }

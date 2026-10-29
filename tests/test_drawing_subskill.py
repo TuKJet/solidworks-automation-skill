@@ -459,6 +459,7 @@ def test_final_pdf_dimension_boxes_replace_com_estimates_for_delivery_pass(tmp_p
             "name": "D1@Front",
             "kind": "overall",
             "text": "",
+            "value_mm": 120,
             "box": {"left": 0.150, "bottom": 0.075, "right": 0.171, "top": 0.096},
             "box_source": "estimated",
             "box_confidence": "low",

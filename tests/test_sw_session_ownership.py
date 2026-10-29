@@ -142,3 +142,36 @@ def test_unreadable_document_list_blocks_creation_without_guessing_empty():
         sw_connect.new_document(app, template_path="fixture.prtdot")
     assert created == []
     assert app.closed == []
+
+
+def test_cleanup_failure_keeps_owned_document_and_raises_stable_code(monkeypatch):
+    app = App()
+    owned = SimpleNamespace(GetTitle=lambda: "脏文档", GetPathName=lambda: "")
+    app.docs = [owned]
+    app.ActiveDoc = owned
+    monkeypatch.setattr(sw_session, "connect_solidworks", lambda **_: (app, owned, {"started_by_cad_studio": False, "process_id": 7}))
+
+    with pytest.raises(sw_session.SolidWorksDocumentCleanupError) as caught:
+        with sw_session.SolidWorksSession() as session:
+            session._remember(owned)
+            monkeypatch.setattr(session, "close", lambda **_: False)
+
+    assert caught.value.code == "SW_DOCUMENT_CLEANUP_FAILED"
+    assert session._owned_documents == [owned]
+    assert app.docs == [owned]
+
+
+def test_cleanup_failure_does_not_mask_body_exception(monkeypatch):
+    app = App()
+    owned = SimpleNamespace(GetTitle=lambda: "脏文档", GetPathName=lambda: "")
+    app.docs = [owned]
+    app.ActiveDoc = owned
+    monkeypatch.setattr(sw_session, "connect_solidworks", lambda **_: (app, owned, {"started_by_cad_studio": False, "process_id": 7}))
+
+    with pytest.raises(ValueError, match="body failed"):
+        with sw_session.SolidWorksSession() as session:
+            session._remember(owned)
+            monkeypatch.setattr(session, "close", lambda **_: (_ for _ in ()).throw(RuntimeError("CloseDoc failed")))
+            raise ValueError("body failed")
+
+    assert session._owned_documents == [owned]

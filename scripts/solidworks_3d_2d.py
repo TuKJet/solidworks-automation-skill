@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import argparse
-from contextlib import redirect_stdout
+from contextlib import contextmanager, nullcontext, redirect_stdout
 from dataclasses import asdict
 from datetime import datetime, timezone
 import importlib.util
@@ -29,6 +29,15 @@ class ConversionBlocked(RuntimeError):
     def __init__(self, code, message):
         self.code = code
         super().__init__(message)
+
+
+@contextmanager
+def _shared_session_context(session):
+    """Yield a batch-owned session and always release that item's documents."""
+    try:
+        yield session
+    finally:
+        session.close_owned_documents()
 
 
 def _run_id():
@@ -72,7 +81,7 @@ def scan_source(source, *, include_assemblies=False, extract_root=None):
         inventory = {"root": str(source.parent), "files": records, "zip_archives": []}
     else:
         raise ConversionBlocked("INPUT_UNSUPPORTED", "Use a project directory or .SLDPRT; assemblies require --include-assemblies. ZIP input must be inside the project directory.")
-    selected, skipped, seen = [], [], set()
+    selected, skipped, duplicates, seen = [], [], [], set()
     # Prefer ordinary source files over identical archive copies.
     for rec in sorted(records, key=lambda x: (bool(x.get("archive")), x["path"].casefold())):
         suffix = Path(rec["path"]).suffix.casefold()
@@ -82,6 +91,7 @@ def scan_source(source, *, include_assemblies=False, extract_root=None):
         # Assembly bytes can refer to different relative dependency trees.
         key = rec["sha256"] if suffix == ".sldprt" else rec["path"].casefold()
         if key in seen:
+            duplicates.append({**rec, "duplicate_of": next((item["path"] for item in selected if (item["sha256"] if suffix == ".sldprt" else item["path"].casefold()) == key), None), "reason": "DEDUPLICATED_SOURCE"})
             continue
         if actual is None:
             skipped.append({"source": rec["path"], "sha256": rec["sha256"], "reason": "ARCHIVE_MODEL_NOT_EXTRACTED", "action": "Run in a new output directory with --extract-zips."})
@@ -90,7 +100,7 @@ def scan_source(source, *, include_assemblies=False, extract_root=None):
         selected.append({**rec, "source": actual})
     skipped = [rec for rec in skipped if rec["sha256"] not in seen]
     return {"schema_version": "1.0", "skill": SKILL_NAME, "source": str(source), "inventory": inventory,
-            "models": selected, "not_converted": skipped,
+            "models": selected, "not_converted": skipped, "duplicates": duplicates,
             "configuration_inventory": {"status": "not_inspected", "reason": "Requires native COM readback"}}
 
 
@@ -133,10 +143,13 @@ def _load_runtime():
     from scripts.sw_document_data import activate_configuration
     from scripts.sw_process import exclusive_cad_job
     from scripts.sw_session import SolidWorksSession
+    from scripts.sw_export import export_drawing_to_dxf_detailed
+    from scripts.dxf_validation import validate_dxf_file
     return {"workflow": workflow, "review_drawing_artifacts": review.review_drawing_artifacts,
             "delivery_verdict": review.delivery_verdict, "get_com_member": get_com_member,
             "activate_configuration": activate_configuration, "exclusive_cad_job": exclusive_cad_job,
-            "SolidWorksSession": SolidWorksSession}
+            "SolidWorksSession": SolidWorksSession, "export_dxf": export_drawing_to_dxf_detailed,
+            "validate_dxf": validate_dxf_file}
 
 
 def _configuration(model, get):
@@ -169,7 +182,7 @@ def _prepare_spec(source, options):
         spec = {"schemaVersion": "1.0", "standard": options.standard, "projection": "first_angle",
                 "paperSize": options.paper, "views": {"front": {}, "top": {}, "right": {}},
                 "insertModelDimensions": True, "notes": [],
-                "outputs": {"slddrw": True, "pdf": True, "report": True}}
+                "outputs": {"slddrw": True, "pdf": True, "dxf": True, "report": True}}
     kind = MODEL_TYPES[source.suffix.casefold()][1]
     if spec.get("documentType", kind) != kind:
         raise ConversionBlocked("DOCUMENT_TYPE_MISMATCH", "Spec documentType disagrees with source extension")
@@ -211,6 +224,86 @@ def _error_code(error):
     return str(getattr(error, "code", None) or type(error).__name__)
 
 
+def _drawing_attempt(session, source, configuration, spec, template, root, stem, runtime):
+    """Create and review a fresh drawing; never edit source dimensions for layout."""
+    workflow, get = runtime["workflow"], runtime["get_com_member"]
+    root.mkdir(parents=True, exist_ok=True)
+    _json_write(root / "drawing_spec_ai.json", spec)
+    drawing = session.new_drawing(template_path=template)
+    try:
+        drawing_path, pdf_path = root / f"{stem}.SLDDRW", root / f"{stem}.pdf"
+        if not session.save(drawing, str(drawing_path)):
+            raise ConversionBlocked("DRAWING_INITIAL_SAVE_FAILED", str(drawing_path))
+        generated = workflow.generate_drawing_from_spec(drawing, spec, str(source), template_candidates=spec["templateCandidates"])
+        _json_write(root / "generation_ai.json", generated)
+        if generated.get("status") not in {"pass", "review_required"}:
+            raise ConversionBlocked(generated.get("error_code") or "DRAWING_GENERATION_FAILED", json.dumps(generated, ensure_ascii=False))
+        views = _view_configuration_evidence(drawing, source, configuration, get)
+        save_ok = bool(session.save(drawing, str(drawing_path)))
+        export_ok = save_ok and bool(workflow.export_sheet_to_pdf(drawing, str(pdf_path), sw_app=session.sw))
+        structure = workflow.inspect_drawing_structure(drawing, paper_size_hint=spec["paperSize"], title_block_box=(generated.get("layout") or {}).get("title_block_box"))
+        _json_write(root / "drawing_structure_ai.json", structure)
+        dxf_path = root / f"{stem}.dxf"
+        dxf = {"status": "not_requested"}
+        if spec.get("outputs", {}).get("dxf", True):
+            native_dxf = runtime["export_dxf"](drawing, str(dxf_path), sw_app=session.sw) if save_ok else {"success": False, "error": "native drawing save failed"}
+            if native_dxf.get("preference_restore") is False or (native_dxf.get("view_blocks_preference") or {}).get("restored") is False:
+                _json_write(root / "dxf_review_ai.json", {"status": "blocked", "native_export": native_dxf})
+                raise ConversionBlocked("SW_EXPORT_PREFERENCE_RESTORE_FAILED", "DXF export preference was not restored")
+            dxf = {"status": "blocked", "native_export": native_dxf}
+            if native_dxf.get("success"):
+                visible_count = sum(d.get("visibility") not in ("hidden", 3) and d.get("visible") is not False for d in structure.get("dimensions", []))
+                dxf["validation"] = runtime["validate_dxf"](dxf_path, expected_visible_dimension_count=visible_count)
+                dxf["status"] = dxf["validation"]["status"]
+            _json_write(root / "dxf_review_ai.json", dxf)
+        review = runtime["review_drawing_artifacts"](spec, structure=structure, pdf_path=pdf_path if export_ok else None)
+        verdict = runtime["delivery_verdict"](save_ok=save_ok, export_ok=export_ok, review=review, manufacturing={"status": "unknown"})
+        status = "blocked" if dxf["status"] == "blocked" else verdict["status"]
+        return {"generation": generated, "view_configurations": views,
+                "status": status, "save": save_ok, "export": export_ok, "review": review, "delivery": verdict, "dxf": dxf,
+                "outputs": {"slddrw": str(drawing_path) if save_ok else None, "pdf": str(pdf_path) if export_ok else None,
+                            "dxf": str(dxf_path) if dxf["status"] in {"pass", "review_required"} else None},
+                "structure": structure, "spec": spec}
+    finally:
+        if not session.close(model=drawing):
+            raise ConversionBlocked("SW_DOCUMENT_CLEANUP_FAILED", "The owned drawing could not be closed; stop before opening another document")
+
+
+def _drawing_with_layout_retries(session, source, configuration, spec, template, root, stem, runtime, max_attempts):
+    from scripts.drawing_quality import accept_candidate, dimension_signature, layout_candidate_specs, quality_metrics
+    best = _drawing_attempt(session, source, configuration, spec, template, root, stem, runtime)
+    history = [{"attempt": 1, "accepted": True, "outputs": best["outputs"],
+                "metrics": quality_metrics(best["structure"], best["review"])}]
+    if best["save"] and best["export"] and history[0]["metrics"]["needs_layout_retry"] and dimension_signature(best["structure"]):
+        candidates = layout_candidate_specs(spec, (best["generation"].get("layout") or {}).get("scale"), max_attempts=max_attempts)
+        for index, candidate_spec in enumerate(candidates, 2):
+            attempt_root = root / f"layout_attempt_{index:02d}"
+            try:
+                candidate = _drawing_attempt(session, source, configuration, candidate_spec, template, attempt_root, stem, runtime)
+                accepted = candidate["save"] and candidate["export"] and candidate.get("dxf", {}).get("status") != "blocked" and accept_candidate(
+                    best["structure"], candidate["structure"], best["review"], candidate["review"])
+                history.append({"attempt": index, "accepted": accepted, "outputs": candidate["outputs"],
+                                "metrics": quality_metrics(candidate["structure"], candidate["review"])})
+                if accepted:
+                    best = candidate
+                if not quality_metrics(best["structure"], best["review"])["needs_layout_retry"]:
+                    break
+            except Exception as error:
+                code = _error_code(error)
+                history.append({"attempt": index, "accepted": False, "error_code": code, "error": str(error)})
+                if code in {"SW_COM_CONNECTION_LOST", "SW_HOST_BUSY", "SW_DOCUMENT_CLEANUP_FAILED", "SW_EXPORT_PREFERENCE_RESTORE_FAILED"}:
+                    raise
+                break
+    best["layout_attempts"] = history
+    best["selected_layout_attempt"] = next(item["attempt"] for item in reversed(history) if item.get("accepted"))
+    _json_write(root / "drawing_structure_ai.json", best.pop("structure"))
+    _json_write(root / "drawing_spec_ai.json", best.pop("spec"))
+    _json_write(root / "generation_ai.json", best["generation"])
+    if "dxf" in best:
+        _json_write(root / "dxf_review_ai.json", best["dxf"])
+    return best
+
+
 def convert_one(source, options, *, runtime=None):
     source = Path(source).expanduser().resolve()
     root = Path(options.output).expanduser().absolute()
@@ -236,8 +329,18 @@ def convert_one(source, options, *, runtime=None):
         capability = workflow.validate_generic_drawing_generation(spec)
         if capability.get("status") != "pass":
             raise ConversionBlocked("DRAWING_SPEC_CAPABILITY_UNSUPPORTED", json.dumps(capability, ensure_ascii=False))
-        with runtime["exclusive_cad_job"]():
-            with runtime["SolidWorksSession"](visible=True) as session:
+        # A batch keeps one COM/SolidWorks connection alive.  Reconnecting for
+        # every part can race SolidWorks' ROT registration while the previous
+        # process is still shutting down (SW_INSTANCE_NOT_READY).  The
+        # project runner supplies ``_session``; standalone calls retain the
+        # original owned-session behavior.
+        shared_session = runtime.get("_session")
+        job_context = nullcontext() if shared_session is not None else runtime["exclusive_cad_job"]()
+        session_context = (_shared_session_context(shared_session)
+                           if shared_session is not None
+                           else runtime["SolidWorksSession"](visible=True))
+        with job_context:
+            with session_context as session:
                 model = session.open(str(source), read_only=True, silent=True, raise_on_error=True)
                 doc_type = int(get(model, "GetType"))
                 path = str(get(model, "GetPathName") or "")
@@ -246,7 +349,10 @@ def convert_one(source, options, *, runtime=None):
                 original_config = _configuration(model, get)
                 if not original_config:
                     raise ConversionBlocked("SOURCE_CONFIGURATION_UNKNOWN", "Native configuration unavailable")
-                if bool(get(model, "GetSaveFlag")):
+                source_save_flag = get(model, "GetSaveFlag")
+                if source_save_flag is None:
+                    raise ConversionBlocked("SOURCE_SAVE_STATE_UNKNOWN", "Native dirty-state readback unavailable")
+                if bool(source_save_flag):
                     raise ConversionBlocked("SOURCE_UNSAVED_CHANGES", "Save or revert the existing model before conversion")
                 result["source_context"] = {"path": path, "document_type": doc_type, "original_configuration": original_config}
                 try:
@@ -265,25 +371,8 @@ def convert_one(source, options, *, runtime=None):
                     validation = validate_drawing_spec(spec)
                     if validation["status"] == "blocked":
                         raise ConversionBlocked("DRAWING_SPEC_BLOCKED", str(validation))
-                    _json_write(root / "drawing_spec_ai.json", spec)
-                    drawing = session.new_drawing(template_path=template)
-                    drawing_path, pdf_path = root / f"{stem}.SLDDRW", root / f"{stem}.pdf"
-                    # Center-mark insertion requires an actual saved drawing.
-                    if not session.save(drawing, str(drawing_path)):
-                        raise ConversionBlocked("DRAWING_INITIAL_SAVE_FAILED", str(drawing_path))
-                    generated = workflow.generate_drawing_from_spec(drawing, spec, str(source), template_candidates=spec["templateCandidates"])
-                    result["generation"] = generated
-                    if generated.get("status") not in {"pass", "review_required"}:
-                        raise ConversionBlocked(generated.get("error_code") or "DRAWING_GENERATION_FAILED", str(generated.get("stage")))
-                    result["view_configurations"] = _view_configuration_evidence(drawing, source, configuration, get)
-                    save_ok = bool(session.save(drawing, str(drawing_path)))
-                    export_ok = save_ok and bool(workflow.export_sheet_to_pdf(drawing, str(pdf_path), sw_app=session.sw))
-                    structure = workflow.inspect_drawing_structure(drawing, paper_size_hint=spec["paperSize"], title_block_box=(generated.get("layout") or {}).get("title_block_box"))
-                    _json_write(root / "drawing_structure_ai.json", structure)
-                    review = runtime["review_drawing_artifacts"](spec, structure=structure, pdf_path=pdf_path if export_ok else None)
-                    verdict = runtime["delivery_verdict"](save_ok=save_ok, export_ok=export_ok, review=review, manufacturing={"status": "unknown"})
-                    result.update(status=verdict["status"], save=save_ok, export=export_ok, review=review, delivery=verdict,
-                                  outputs={"slddrw": str(drawing_path) if save_ok else None, "pdf": str(pdf_path) if export_ok else None})
+                    result.update(_drawing_with_layout_retries(session, source, configuration, spec, template,
+                                  root, stem, runtime, getattr(options, "layout_attempts", 3)))
                 finally:
                     result["source_configuration_restored"] = False
                     active = _configuration(model, get)
@@ -335,18 +424,21 @@ def convert_project(options, *, runtime=None):
         runtime = runtime or _load_runtime()
         previous_error, error_count = None, 0
         with runtime["exclusive_cad_job"]():
-            for index, row in enumerate(models, 1):
-                item_options = argparse.Namespace(**vars(options))
-                item_options.output = root / f"part{index:04d}_{row['sha256'][:12]}"
-                result = convert_one(Path(row["source"]), item_options, runtime=runtime)
-                payload["results"].append(result)
-                code = result.get("error_code")
-                error_count = error_count + 1 if code and code == previous_error else int(bool(code))
-                previous_error = code
-                _json_write(report_path, payload)
-                if code in {"SW_COM_CONNECTION_LOST", "SW_HOST_BUSY"} or error_count >= 2:
-                    payload["not_converted"].extend({"source": r["source"], "reason": "BATCH_STOPPED_AFTER_ERROR"} for r in models[index:])
-                    break
+            with runtime["SolidWorksSession"](visible=True) as session:
+                batch_runtime = dict(runtime)
+                batch_runtime["_session"] = session
+                for index, row in enumerate(models, 1):
+                    item_options = argparse.Namespace(**vars(options))
+                    item_options.output = root / f"part{index:04d}_{row['sha256'][:12]}"
+                    result = convert_one(Path(row["source"]), item_options, runtime=batch_runtime)
+                    payload["results"].append(result)
+                    code = result.get("error_code")
+                    error_count = error_count + 1 if code and code == previous_error else int(bool(code))
+                    previous_error = code
+                    _json_write(report_path, payload)
+                    if code in {"SW_COM_CONNECTION_LOST", "SW_HOST_BUSY", "SW_DOCUMENT_CLEANUP_FAILED", "SW_EXPORT_PREFERENCE_RESTORE_FAILED"} or error_count >= 2:
+                        payload["not_converted"].extend({"source": r["source"], "reason": "BATCH_STOPPED_AFTER_ERROR"} for r in models[index:])
+                        break
         statuses = {r["status"] for r in payload["results"]}
         payload["status"] = "blocked" if statuses & {"blocked", "failed"} else "review_required" if "review_required" in statuses or payload["not_converted"] else "pass"
     except Exception as error:
@@ -375,10 +467,17 @@ def _parser():
     conv.add_argument("--paper", choices=["A4", "A3", "A2", "A1", "A0"], default="A3")
     conv.add_argument("--standard", choices=["GB_T", "ISO"], default="GB_T")
     conv.add_argument("--configuration")
+    conv.add_argument("--layout-attempts", type=int, choices=[1, 2, 3], default=3,
+                      help="Bounded redraws for confirmed crowding; preserve dimension identity/value/visibility and retain the better verified candidate")
     conv.add_argument("--output", type=Path)
     conv.add_argument("--spec", type=Path)
     conv.add_argument("--include-assemblies", action="store_true")
     conv.add_argument("--extract-zips", action="store_true", help="Extract validated project archives under this new run, retaining relative references")
+    step = sub.add_parser("export-step", help="Export native parts and assemblies to reviewed STEP files for FreeCAD")
+    step.add_argument("--source", type=Path, required=True)
+    step.add_argument("--output", type=Path)
+    step.add_argument("--configuration")
+    step.add_argument("--extract-zips", action="store_true")
     return parser
 
 
@@ -390,6 +489,9 @@ def main(argv=None):
                 payload = doctor()
             elif args.command == "inventory":
                 payload = write_inventory(args.source, args.output, include_assemblies=args.include_assemblies)
+            elif args.command == "export-step":
+                from scripts.step_conversion import export_step_project
+                payload = export_step_project(args)
             else:
                 payload = convert_project(args)
     except Exception as error:

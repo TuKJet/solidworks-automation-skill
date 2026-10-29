@@ -28,6 +28,17 @@ EXPORTERS = {
 }
 
 
+class SolidWorksDocumentCleanupError(RuntimeError):
+    """Raised when one or more documents owned by this session cannot close."""
+
+    code = "SW_DOCUMENT_CLEANUP_FAILED"
+
+    def __init__(self, failures):
+        self.failures = tuple(failures)
+        details = "; ".join(f"{type(model).__name__}: {exc}" for model, exc in self.failures)
+        super().__init__(f"{self.code}: 无法关闭本轮自有文档 ({details})")
+
+
 class SolidWorksSession:
     """
     SolidWorks 自动化会话。
@@ -63,10 +74,20 @@ class SolidWorksSession:
         """@brief 进入受控会话，自动清理仅针对本轮登记的文档。"""
         return self
 
-    def __exit__(self, *_):
+    def __exit__(self, exc_type, exc_value, traceback):
         """@brief 结束时清理自有文档；共享实例与用户文档保持打开。"""
-        self.close_owned_documents()
-        self.quit_owned_instance()
+        cleanup_error = None
+        try:
+            self.close_owned_documents()
+        except Exception as exc:
+            cleanup_error = exc
+        try:
+            self.quit_owned_instance()
+        except Exception:
+            if cleanup_error is None and exc_type is None:
+                raise
+        if cleanup_error is not None and exc_type is None:
+            raise cleanup_error
 
     def _documents(self):
         """@brief 读取当前文档，读取失败不得猜测没有用户文档。"""
@@ -80,13 +101,18 @@ class SolidWorksSession:
 
     def close_owned_documents(self):
         """@brief 清理本轮文档；失效代理不按旧标题猜测关闭别的文档。"""
+        failures = []
         for model in list(reversed(self._owned_documents)):
             try:
-                self.close(model=model)
-            except Exception:
-                # 依赖文档可能已被 SolidWorks 卸载；禁止重用陈旧标题。
-                pass
-        self._owned_documents.clear()
+                closed = self.close(model=model)
+                if closed is not True:
+                    raise RuntimeError("关闭自有文档返回 False")
+            except Exception as exc:
+                # Keep failed objects in the ownership ledger so a shared batch
+                # cannot continue with a dirty session.
+                failures.append((model, exc))
+        if failures:
+            raise SolidWorksDocumentCleanupError(failures) from failures[0][1]
 
     @property
     def active_doc(self):

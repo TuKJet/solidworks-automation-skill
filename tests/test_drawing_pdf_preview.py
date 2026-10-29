@@ -55,7 +55,7 @@ def test_portrait_pdf_dimension_matching_uses_actual_sheet_dimensions(tmp_path):
     structure = {
         "sheets": ["Sheet1"],
         "sheet_size": {"width_m": .210, "height_m": .297},
-        "dimensions": [{"sheet": "Sheet1", "name": str(index), "box_evidence": {"position_m": [x, y]}} for index, (x, y) in enumerate(positions)],
+        "dimensions": [{"sheet": "Sheet1", "name": str(index), "value_mm": 20 + index * 10, "box_evidence": {"position_m": [x, y]}} for index, (x, y) in enumerate(positions)],
     }
     actual = inspect_pdf_dimension_rendering(source, structure)
     assert actual["status"] == "pass"

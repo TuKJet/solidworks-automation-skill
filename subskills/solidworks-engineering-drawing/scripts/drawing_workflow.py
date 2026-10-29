@@ -9,9 +9,11 @@ from pathlib import Path
 try:
     from scripts.sw_preflight import import_com_dependencies
     from scripts.sw_connect import activate_document_verified, create_empty_dispatch_variant, get_com_member
+    from scripts.drawing_quality import STANDARD_DRAWING_SCALES
 except ImportError:
     from sw_preflight import import_com_dependencies
     from sw_connect import activate_document_verified, create_empty_dispatch_variant, get_com_member
+    from drawing_quality import STANDARD_DRAWING_SCALES
 
 pythoncom, _win32com, VARIANT = import_com_dependencies()
 
@@ -26,8 +28,6 @@ PAPER_SIZES = {
     "A0": {"code": 11, "width_m": 1.189, "height_m": 0.841},
 }
 PAPER_SIZE_CODES = {6: "A4", 7: "A4", 8: "A3", 9: "A2", 10: "A1", 11: "A0"}
-
-STANDARD_DRAWING_SCALES = (10.0, 5.0, 2.0, 1.0, 0.5, 0.2, 0.1, 0.05, 0.02, 0.01)
 
 # SolidWorks.Interop.swconst.swAlignDimensionType_e（SW2026 Interop 反射确认）。
 ALIGN_DIMENSION_TYPES = {
@@ -831,14 +831,51 @@ def _scale_ratio(scale):
     return ratio.numerator, ratio.denominator
 
 
+def _read_view_scale_ratio(view):
+    """@brief 回读视图实际比例，未知或非法值不得被当作请求值。"""
+    actual = _view_scale_state(view)["scale_ratio"]
+    if actual is None:
+        raise RuntimeError("视图比例回读失败或非法")
+    return actual
+
+
+def _sync_generated_sheet_scale(drawing_model, numerator, denominator):
+    """@brief 将新生成图纸的 sheet 比例同步到规划比例并严格回读。"""
+    sheet = _safe_member(drawing_model, "GetCurrentSheet")
+    set_scale = getattr(sheet, "SetScale", None) if sheet is not None else None
+    if sheet is None or set_scale is None:
+        raise RuntimeError("当前图纸不支持 ISheet.SetScale")
+    requested = [float(numerator), float(denominator)]
+    result = get_com_member(sheet, "SetScale", *requested, False, False)
+    if result is False:
+        raise RuntimeError("ISheet.SetScale 返回 False")
+    actual_sheet = _sheet_scale(sheet)
+    actual_ratio = [actual_sheet["numerator"], actual_sheet["denominator"]] if actual_sheet else None
+    if not _same_scale_ratio(requested, actual_ratio):
+        raise RuntimeError(f"图纸比例回读不一致: requested={requested}, actual={actual_ratio}")
+    views = _as_sequence(_safe_member(sheet, "GetViews", default=[]))
+    view_checks = []
+    for view in views:
+        actual = _read_view_scale_ratio(view)
+        matched = _same_scale_ratio(requested, actual)
+        view_checks.append({"name": str(_safe_member(view, "Name", default="")), "scale_ratio": actual, "matched": matched})
+        if not matched:
+            raise RuntimeError(
+                f"生成视图比例回读不一致: requested={requested}, actual={actual}"
+            )
+    return {"status": "pass", "requested": requested, "actual": actual_ratio, "views": view_checks}
+
+
 def _apply_view_layout(view, item, numerator, denominator) -> dict:
     """@brief 将已创建视图移动到规划中心并设置独立比例。"""
     center = [float(item["center"][0]), float(item["center"][1])]
     if hasattr(view, "UseParentScale"):
         view.UseParentScale = False
+    if hasattr(view, "UseSheetScale"):
+        view.UseSheetScale = False
     if hasattr(view, "PositionLocked"):
         view.PositionLocked = False
-    view.ScaleRatio = (int(numerator), int(denominator))
+    view.ScaleRatio = VARIANT(pythoncom.VT_ARRAY | pythoncom.VT_R8, (float(numerator), float(denominator)))
     position = VARIANT(pythoncom.VT_ARRAY | pythoncom.VT_R8, center)
     method = getattr(view, "SetViewPosition", None)
     if method is not None:
@@ -855,6 +892,12 @@ def _apply_view_layout(view, item, numerator, denominator) -> dict:
     )
     if not position_verified:
         raise RuntimeError(f"视图位置回读不一致: requested={center}, actual={actual_position}")
+    actual_scale_ratio = _read_view_scale_ratio(view)
+    requested_scale_ratio = [int(numerator), int(denominator)]
+    if not _same_scale_ratio(requested_scale_ratio, actual_scale_ratio):
+        raise RuntimeError(
+            f"视图比例回读不一致: requested={requested_scale_ratio}, actual={actual_scale_ratio}"
+        )
     return {
         "name": item["name"],
         "actual_name": str(_safe_member(view, "Name", default="")),
@@ -862,7 +905,7 @@ def _apply_view_layout(view, item, numerator, denominator) -> dict:
         "center": center,
         "actual_center": list(actual_position),
         "position_verified": True,
-        "scale_ratio": [int(numerator), int(denominator)],
+        "scale_ratio": list(actual_scale_ratio),
     }
 
 
@@ -1097,6 +1140,19 @@ def create_adaptive_standard_views(drawing_model, part_path, layout) -> dict:
                                 "error_code": "DRAWING_VIEW_POSITION_FAILED",
                                 "error": str(exc),
                             }
+                        try:
+                            sheet_scale = _sync_generated_sheet_scale(drawing_model, numerator, denominator)
+                        except Exception as exc:
+                            return {
+                                "status": "blocked",
+                                "stage": "sheet_scale",
+                                "backend": f"native_{projection}",
+                                "views": created,
+                                "retryable": False,
+                                "error_code": "DRAWING_SHEET_SCALE_SYNC_FAILED",
+                                "error": str(exc),
+                                "manual_review_required": True,
+                            }
                         refinement = _refine_standard_view_spacing(
                             view_objects,
                             created,
@@ -1118,6 +1174,7 @@ def create_adaptive_standard_views(drawing_model, part_path, layout) -> dict:
                             "mapping_method": mapping_method,
                             "native_view_diagnostics": diagnostics,
                             "layout_refinement": refinement,
+                            "sheet_scale": sheet_scale,
                             "views": created,
                             "view_count": len(created),
                             "retryable": False,
@@ -1157,6 +1214,19 @@ def create_adaptive_standard_views(drawing_model, part_path, layout) -> dict:
                 "error_code": "DRAWING_VIEW_POSITION_FAILED",
                 "error": str(exc),
             }
+    try:
+        sheet_scale = _sync_generated_sheet_scale(drawing_model, numerator, denominator)
+    except Exception as exc:
+        return {
+            "status": "blocked",
+            "stage": "sheet_scale",
+            "backend": "individual_model_views",
+            "views": created,
+            "retryable": False,
+            "error_code": "DRAWING_SHEET_SCALE_SYNC_FAILED",
+            "error": str(exc),
+            "manual_review_required": True,
+        }
     refinement = _refine_standard_view_spacing(
         view_objects,
         created,
@@ -1168,6 +1238,7 @@ def create_adaptive_standard_views(drawing_model, part_path, layout) -> dict:
         "stage": "create",
         "backend": "individual_model_views",
         "views": created,
+        "sheet_scale": sheet_scale,
         "layout_refinement": refinement,
         "view_count": len(created),
         "retryable": False,
@@ -2899,12 +2970,15 @@ def generate_drawing_from_spec(drawing_model, spec, source_model_path, template_
     if sheet_setup.get("status") != "pass":
         return {"status": sheet_setup.get("status", "blocked"), "stage": "sheet", "sheetSetup": sheet_setup, "error_code": sheet_setup.get("error_code"), "manual_review_required": True}
     model_size_m = tuple(float(value) / 1000.0 for value in model_size_mm)
+    layout_options = spec.get("layoutOptions") or {}
     layout = plan_standard_view_layout(
         model_size_m,
         paper_size=paper_size,
         projection=projection,
         requested_scale=spec.get("scale"),
         sheet_dimensions_m=sheet_setup.get("sheet_size"),
+        margin_m=float(layout_options.get("marginMm", 12)) / 1000.0,
+        gap_m=float(layout_options.get("viewGapMm", 18)) / 1000.0,
     )
     if layout.get("status") != "pass":
         return {"status": "blocked", "stage": "layout", "sheetSetup": sheet_setup, "layout": layout, "error_code": layout.get("error_code"), "manual_review_required": True}

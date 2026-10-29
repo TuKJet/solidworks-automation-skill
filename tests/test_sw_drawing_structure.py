@@ -19,10 +19,16 @@ from scripts.sw_drawing import (
     setup_current_sheet_as_a3,
 )
 from scripts.sw_review import review_drawing_layout
+from scripts import sw_drawing
 
 
 class TypedPositionView:
     """@brief 模拟 COM setter 解封 SAFEARRAY，而 getter 返回坐标序列。"""
+    def __setattr__(self, name, value):
+        if name == "ScaleRatio":
+            value = getattr(value, "value", value)
+        super().__setattr__(name, value)
+
     @property
     def Position(self):
         return getattr(self, "_position", None)
@@ -836,10 +842,28 @@ def test_create_adaptive_views_uses_planned_positions_and_scale():
     class View(TypedPositionView):
         ScaleRatio = None
 
+    class Sheet:
+        def __init__(self, drawing):
+            self.drawing = drawing
+            self.scale = (1.0, 1.0)
+
+        def SetScale(self, numerator, denominator, *_flags):
+            self.scale = (numerator, denominator)
+            return True
+
+        def GetProperties2(self):
+            return (8, 12, *self.scale, 1, 0.420, 0.297, 0)
+
+        def GetViews(self):
+            return self.drawing.views
+
     class Drawing:
         def __init__(self):
             self.calls = []
             self.views = []
+
+        def GetCurrentSheet(self):
+            return Sheet(self)
 
         def CreateDrawViewFromModelView3(self, path, name, x, y, z):
             self.calls.append((path, name, x, y, z))
@@ -855,6 +879,101 @@ def test_create_adaptive_views_uses_planned_positions_and_scale():
     assert result["view_count"] == 3
     assert [call[1] for call in drawing.calls] == ["*Front", "*Top", "*Right"]
     assert all(view.ScaleRatio == tuple(layout["scale_ratio"]) for view in drawing.views)
+
+
+def test_view_layout_rejects_scale_setter_that_does_not_change_actual_ratio():
+    """@brief 比例 setter 被 COM 静默忽略时不得把请求值当成事实。"""
+    class View(TypedPositionView):
+        Name = "Front"
+        _scale_ratio = (1.0, 1.0)
+
+        @property
+        def ScaleRatio(self):
+            return self._scale_ratio
+
+        @ScaleRatio.setter
+        def ScaleRatio(self, _value):
+            pass
+
+    view = View()
+    item = {"name": "*Front", "center": [0.1, 0.1]}
+    with pytest.raises(RuntimeError, match="视图比例回读不一致"):
+        sw_drawing._MODULE._apply_view_layout(view, item, 1, 2)
+
+
+def test_view_layout_detaches_sheet_and_parent_scale_before_setting_ratio():
+    class View(TypedPositionView):
+        Name = "Front"
+        UseSheetScale = True
+        UseParentScale = True
+        _scale_ratio = (5.0, 1.0)
+
+        @property
+        def ScaleRatio(self):
+            return self._scale_ratio
+
+        @ScaleRatio.setter
+        def ScaleRatio(self, value):
+            assert all(isinstance(item, float) for item in value)
+            if not self.UseSheetScale and not self.UseParentScale:
+                self._scale_ratio = value
+
+    view = View()
+    result = sw_drawing._MODULE._apply_view_layout(view, {"name": "*Front", "center": [0.1, 0.1]}, 2, 1)
+    assert result["scale_ratio"] == [2.0, 1.0]
+
+
+def test_generated_views_sync_and_verify_sheet_scale():
+    class View:
+        Name = "Front"
+        ScaleRatio = (1.0, 2.0)
+
+    class Sheet:
+        def __init__(self):
+            self.scale = (5.0, 1.0)
+            self.view = View()
+
+        def SetScale(self, numerator, denominator, use_sheet_scale, use_parent_scale):
+            assert (use_sheet_scale, use_parent_scale) == (False, False)
+            self.scale = (numerator, denominator)
+            return True
+
+        def GetProperties2(self):
+            return (8, 12, *self.scale, 1, 0.420, 0.297, 0)
+
+        def GetViews(self):
+            return [self.view]
+
+    class Drawing:
+        def __init__(self):
+            self.sheet = Sheet()
+
+        def GetCurrentSheet(self):
+            return self.sheet
+
+    result = sw_drawing._MODULE._sync_generated_sheet_scale(Drawing(), 1, 2)
+    assert result["status"] == "pass"
+    assert result["actual"] == [1.0, 2.0]
+    assert result["views"][0]["matched"] is True
+
+
+def test_generated_views_block_when_sheet_scale_setter_is_ignored():
+    class Sheet:
+        def SetScale(self, *_args):
+            return True
+
+        def GetProperties2(self):
+            return (8, 12, 5.0, 1.0, 1, 0.420, 0.297, 0)
+
+        def GetViews(self):
+            return []
+
+    class Drawing:
+        def GetCurrentSheet(self):
+            return Sheet()
+
+    with pytest.raises(RuntimeError, match="图纸比例回读不一致"):
+        sw_drawing._MODULE._sync_generated_sheet_scale(Drawing(), 1, 2)
 
 
 def test_create_adaptive_views_falls_back_to_native_third_angle_and_maps_orientation():
@@ -876,6 +995,13 @@ def test_create_adaptive_views_falls_back_to_native_third_angle_and_maps_orienta
 
         def GetViews(self):
             return self.drawing.views
+
+        def SetScale(self, numerator, denominator, *_flags):
+            self.scale = (numerator, denominator)
+            return True
+
+        def GetProperties2(self):
+            return (8, 12, *getattr(self, "scale", (1.0, 1.0)), 1, 0.420, 0.297, 0)
 
     class Drawing:
         def __init__(self):
@@ -930,6 +1056,13 @@ def test_create_adaptive_first_angle_views_repositions_native_third_angle_fallba
 
         def GetViews(self):
             return self.drawing.views
+
+        def SetScale(self, numerator, denominator, *_flags):
+            self.scale = (numerator, denominator)
+            return True
+
+        def GetProperties2(self):
+            return (8, 12, *getattr(self, "scale", (1.0, 1.0)), 1, 0.420, 0.297, 0)
 
     class Drawing:
         def __init__(self):
@@ -990,6 +1123,13 @@ def test_create_adaptive_views_refines_spacing_from_native_outlines():
 
         def GetViews(self):
             return self.drawing.views
+
+        def SetScale(self, numerator, denominator, *_flags):
+            self.scale = (numerator, denominator)
+            return True
+
+        def GetProperties2(self):
+            return (8, 12, *getattr(self, "scale", (1.0, 1.0)), 1, 0.420, 0.297, 0)
 
     class Drawing:
         def __init__(self):
@@ -1099,6 +1239,10 @@ def test_setup_current_sheet_preserves_sheet_and_view_scale_chain(tmp_path):
 
         def SetupSheet6(self, *args):
             self.args = args
+            # Some SolidWorks versions reset independent view scales while
+            # applying the sheet format; the workflow must restore them.
+            for view in self.sheet.views:
+                view.ScaleRatio = (1.0, 1.0)
             return True
 
         def ForceRebuild3(self, _top_only):

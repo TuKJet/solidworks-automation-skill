@@ -15,6 +15,46 @@ except ImportError:
 pythoncom, _win32com, VARIANT = import_com_dependencies()
 
 SUPPORTED_BATCH_FORMATS = {".step", ".stp", ".stl", ".igs", ".iges", ".x_t", ".pdf", ".dxf", ".dwg"}
+_SW_CONSTANT_CACHE = {}
+
+
+def _resolve_sw_constant(name, sw_app=None):
+    """Resolve a registered SolidWorks enum without inventing numeric IDs."""
+    value = _SW_CONSTANT_CACHE.get(name)
+    if value is not None:
+        return value
+    constants = getattr(_win32com, "constants", None)
+    value = getattr(constants, name, None) if constants is not None else None
+    if value is not None:
+        _SW_CONSTANT_CACHE[name] = value
+        return value
+    candidates = []
+    if sw_app is not None:
+        try:
+            executable = Path(str(get_com_member(sw_app, "GetExecutablePath", default="") or ""))
+            roots = [executable.parent if executable.suffix.casefold() == ".exe" else executable] if executable.name else []
+            tlb_paths = []
+            for root in roots:
+                tlb_paths.extend((root / "swconst.tlb", root / "api" / "swconst.tlb", root / "api" / "redist" / "swconst.tlb"))
+            import pythoncom
+            import win32com.client.gencache as gencache
+            for tlb_path in tlb_paths:
+                if tlb_path.is_file():
+                    attrs = pythoncom.LoadTypeLib(str(tlb_path)).GetLibAttr()
+                    candidates.append(gencache.EnsureModule(attrs[0], attrs[1], attrs[3], attrs[4]))
+        except Exception:
+            pass
+    try:
+        from .sw_delivery import _load_sldworks_typelib_module
+        candidates.append(_load_sldworks_typelib_module())
+    except Exception:
+        pass
+    for candidate in candidates:
+        value = getattr(candidate, name, None) if candidate is not None else None
+        if value is not None:
+            _SW_CONSTANT_CACHE[name] = value
+            return value
+    return None
 
 
 def _ensure_parent_dir(file_path):
@@ -24,9 +64,42 @@ def _ensure_parent_dir(file_path):
         os.makedirs(parent, exist_ok=True)
 
 
+def export_to_step_detailed(model, output_path, *, sw_app=None):
+    """导出 STEP 并保留原生错误/警告及新鲜文件证据。"""
+    output_path = os.path.abspath(os.path.expandvars(os.path.expanduser(output_path)))
+    before = _file_signature(output_path)
+    try:
+        sw = sw_app if sw_app is not None else get_com_member(model, "GetSldWorksObject", default=None)
+        if sw is None:
+            raise RuntimeError("STEP export refused: SolidWorks application object unavailable")
+        source_path = str(get_com_member(model, "GetPathName", default="") or "")
+        expected_type = get_com_member(model, "GetType", default=None)
+        if not source_path or expected_type is None:
+            raise RuntimeError("STEP export refused: source path/type unavailable")
+        activate_document_verified(sw, model, source_path, expected_type=expected_type)
+        clear_selection = getattr(model, "ClearSelection2", None)
+        if clear_selection is None or not callable(clear_selection):
+            raise RuntimeError("STEP export refused: ClearSelection2 unavailable")
+        clear_selection(True)
+        _ensure_parent_dir(output_path)
+        errors = VARIANT(pythoncom.VT_BYREF | pythoncom.VT_I4, 0)
+        warnings = VARIANT(pythoncom.VT_BYREF | pythoncom.VT_I4, 0)
+        success = bool(model.Extension.SaveAs(output_path, 0, 1, create_empty_dispatch_variant(), errors, warnings))
+        after = _file_signature(output_path)
+        error_code = int(getattr(errors, "value", errors) or 0)
+        warning_code = int(getattr(warnings, "value", warnings) or 0)
+        fresh = after is not None and after != before
+        return {"success": success and fresh and error_code == 0, "native_success": success,
+                "errors": error_code, "warnings": warning_code, "fresh_file": fresh,
+                "path": output_path, "file_signature": after}
+    except Exception as exc:
+        return {"success": False, "native_success": False, "errors": None, "warnings": None,
+                "fresh_file": False, "path": output_path, "error": str(exc)}
+
+
 def export_to_step(model, output_path):
-    """导出为 STEP 格式"""
-    return _export_generic(model, output_path)
+    """兼容旧 bool 接口的 STEP 导出封装。"""
+    return bool(_export_generic(model, output_path))
 
 
 def export_to_stl(model, output_path, quality="fine"):
@@ -109,6 +182,84 @@ def export_to_dxf(model, output_path):
     else:
         # 零件默认按“展开几何 + 折弯线”导出；其余选项由位掩码控制。
         return export_flat_pattern_dxf(model, output_path)
+
+
+def export_drawing_to_dxf_detailed(model, output_path, *, sw_app=None):
+    """安全导出工程图 DXF，强制工程图类型并保留原生证据。"""
+    output_path = os.path.abspath(os.path.expandvars(os.path.expanduser(output_path)))
+    before = _file_signature(output_path)
+    preference_token = None
+    try:
+        sw = sw_app if sw_app is not None else get_com_member(model, "GetSldWorksObject", default=None)
+        if sw is None:
+            raise RuntimeError("DXF export refused: SolidWorks application object unavailable")
+        source_path = str(get_com_member(model, "GetPathName", default="") or "")
+        actual_type = get_com_member(model, "GetType", default=None)
+        if not source_path or actual_type is None:
+            raise RuntimeError("DXF export refused: source path/type unavailable")
+        if int(actual_type) != 3:
+            raise RuntimeError(f"DXF export requires drawing document type 3, got {actual_type}")
+        activate_document_verified(sw, model, source_path, expected_type=3)
+        clear_selection = getattr(model, "ClearSelection2", None)
+        if clear_selection is None or not callable(clear_selection):
+            raise RuntimeError("DXF export refused: ClearSelection2 unavailable")
+        clear_selection(True)
+        blocks_pref = _resolve_sw_constant("swDxfExportViewAsBlock", sw)
+        getter = getattr(sw, "GetUserPreferenceToggle", None)
+        setter = getattr(sw, "SetUserPreferenceToggle", None)
+        if blocks_pref is None or not callable(getter) or not callable(setter):
+            raise RuntimeError("DXF export refused: swDxfExportViewAsBlock preference unavailable")
+        original_blocks = getter(blocks_pref)
+        if original_blocks not in (True, False) or original_blocks is None:
+            raise RuntimeError("DXF export refused: view-block preference readback unavailable")
+        original_blocks = bool(original_blocks)
+        preference_token = (setter, getter, blocks_pref, original_blocks)
+        setter(blocks_pref, False)
+        forced_blocks = getter(blocks_pref)
+        if forced_blocks is None or forced_blocks != False:
+            raise RuntimeError("DXF export refused: failed to disable view-block export")
+        scale_preferences = {}
+        no_scale_pref = _resolve_sw_constant("swDxfOutputNoScale", sw)
+        scale_factor_pref = _resolve_sw_constant("swDxfOutputScaleFactor", sw)
+        int_getter = getattr(sw, "GetUserPreferenceIntegerValue", None)
+        double_getter = getattr(sw, "GetUserPreferenceDoubleValue", None)
+        scale_preferences["swDxfOutputNoScale"] = int_getter(no_scale_pref) if no_scale_pref is not None and callable(int_getter) else None
+        scale_preferences["swDxfOutputScaleFactor"] = double_getter(scale_factor_pref) if scale_factor_pref is not None and callable(double_getter) else None
+        _ensure_parent_dir(output_path)
+        errors = VARIANT(pythoncom.VT_BYREF | pythoncom.VT_I4, 0)
+        warnings = VARIANT(pythoncom.VT_BYREF | pythoncom.VT_I4, 0)
+        native_success = bool(model.Extension.SaveAs(output_path, 0, 1, create_empty_dispatch_variant(), errors, warnings))
+        after = _file_signature(output_path)
+        error_code = int(getattr(errors, "value", errors) or 0)
+        warning_code = int(getattr(warnings, "value", warnings) or 0)
+        fresh = after is not None and after != before
+        restore_ok = True
+        try:
+            setter(blocks_pref, original_blocks)
+            actual_restored = getter(blocks_pref)
+            restore_ok = actual_restored is not None and actual_restored == original_blocks
+        except Exception:
+            restore_ok = False
+        preference_token = None if restore_ok else preference_token
+        export_ok = native_success and error_code == 0 and fresh and restore_ok
+        return {"success": export_ok, "native_success": native_success,
+                "errors": error_code, "warnings": warning_code, "fresh_file": fresh, "path": output_path, "file_signature": after,
+                "native_export_status": "pass" if export_ok else "blocked",
+                "review_required": warning_code != 0, "view_blocks_preference": {"original": original_blocks, "forced_false": True, "restored": restore_ok},
+                "scale_preferences": scale_preferences}
+    except Exception as exc:
+        restore_ok = True
+        if preference_token is not None:
+            setter, getter, blocks_pref, original_blocks = preference_token
+            try:
+                setter(blocks_pref, original_blocks)
+                actual_restored = getter(blocks_pref)
+                restore_ok = actual_restored is not None and actual_restored == original_blocks
+            except Exception:
+                restore_ok = False
+        return {"success": False, "native_success": False, "errors": None, "warnings": None, "fresh_file": False,
+                "path": output_path, "native_export_status": "blocked", "review_required": False,
+                "preference_restore": restore_ok, "error": str(exc)}
 
 
 def export_flat_pattern_dxf(

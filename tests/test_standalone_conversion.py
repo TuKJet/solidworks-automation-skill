@@ -63,11 +63,13 @@ def runtime():
     pytest.importorskip("win32com.client")
     from scripts.sw_drawing import validate_generic_drawing_generation
     from scripts.sw_drawing_review import delivery_verdict
-    state = SimpleNamespace(models=[], drawings=[], generation_specs=[], pdf_ok=True, view_mismatch=False, open_calls=0)
+    state = SimpleNamespace(models=[], drawings=[], generation_specs=[], pdf_ok=True, view_mismatch=False,
+                            open_calls=0, session_count=0, close_document_calls=0)
 
     class Session:
         def __init__(self, visible):
             assert visible is True
+            state.session_count += 1
             self.sw = object()
 
         def __enter__(self):
@@ -75,6 +77,13 @@ def runtime():
 
         def __exit__(self, *args):
             return False
+
+        def close_owned_documents(self):
+            state.close_document_calls += 1
+
+        def close(self, model):
+            assert isinstance(model, Drawing)
+            return True
 
         def open(self, path, read_only, silent, raise_on_error):
             assert (read_only, silent, raise_on_error) == (True, True, True)
@@ -116,12 +125,17 @@ def runtime():
         Path(path).write_bytes(b"pdf" if state.pdf_ok else b"partial")
         return state.pdf_ok
 
+    def export_dxf(drawing, path, *, sw_app):
+        Path(path).write_text("0\nSECTION\n2\nENTITIES\n0\nLINE\n0\nTEXT\n1\n25\n0\nENDSEC\n0\nEOF\n", encoding="ascii")
+        return {"success": True, "errors": 0, "warnings": 0}
+
     workflow = SimpleNamespace(validate_generic_drawing_generation=validate_generic_drawing_generation,
                                generate_drawing_from_spec=generate, export_sheet_to_pdf=export,
                                inspect_drawing_structure=lambda drawing, **kwargs: {"views": [], "dimensions": []})
     return {"SolidWorksSession": Session, "exclusive_cad_job": nullcontext, "get_com_member": member,
             "activate_configuration": activate, "workflow": workflow, "delivery_verdict": delivery_verdict,
-            "review_drawing_artifacts": lambda spec, **kwargs: {"status": "review_required"}, "state": state}
+            "review_drawing_artifacts": lambda spec, **kwargs: {"status": "review_required"}, "state": state,
+            "export_dxf": export_dxf, "validate_dxf": lambda *args, **kwargs: {"status": "review_required"}}
 
 
 def options(tmp_path, source=None, **overrides):
@@ -250,6 +264,8 @@ def test_main_same_name_models_have_unique_outputs(tmp_path, runtime, monkeypatc
     assert payload["status"] == "review_required"
     assert len(payload["results"]) == 2
     assert len({item["outputs"]["slddrw"] for item in payload["results"]}) == 2
+    assert runtime["state"].session_count == 1
+    assert runtime["state"].close_document_calls == 2
     assert Path(payload["output_root"]).is_relative_to(src / "agent")
     assert Path(payload["report"]).is_file()
 
@@ -264,6 +280,8 @@ def test_repeated_failures_stop_batch_with_unprocessed_items(tmp_path, runtime):
     assert result["status"] == "blocked"
     assert len(result["results"]) == 2
     assert len(result["not_converted"]) == 2
+    assert runtime["state"].session_count == 1
+    assert runtime["state"].close_document_calls == 2
 
 
 def test_doctor_uses_real_preflight_contract(monkeypatch):
@@ -328,3 +346,57 @@ def test_main_reports_archive_only_inputs_without_silent_success(tmp_path, runti
     extracted = json.loads(capsys.readouterr().out)
     assert extracted["results"][0]["source_unchanged"]
     assert Path(extracted["results"][0]["source"]).is_relative_to(Path(extracted["output_root"]) / "sources_ai")
+
+
+def test_cleanup_failure_stops_batch_before_second_source(tmp_path, runtime):
+    src=tmp_path/'project'
+    part(src,'a.SLDPRT'); part(src,'b.SLDPRT',b'b')
+    runtime['SolidWorksSession'].close=lambda self, model: False
+    result=cli.convert_project(options(tmp_path,src), runtime=runtime)
+    assert len(result['results'])==1
+    assert result['results'][0]['error_code']=='SW_DOCUMENT_CLEANUP_FAILED'
+    assert len(result['not_converted'])==1
+
+
+def test_dxf_export_failure_does_not_publish_partial_dxf(tmp_path, runtime):
+    src=part(tmp_path)
+    def failed(drawing,path,**kwargs):
+        Path(path).write_bytes(b'partial')
+        return {'success':False,'errors':1}
+    runtime['export_dxf']=failed
+    result=cli.convert_one(src,options(tmp_path,src),runtime=runtime)
+    assert result['status']=='blocked'
+    assert result['outputs']['dxf'] is None
+    assert result['outputs']['pdf']
+
+
+def test_dxf_preference_restore_failure_stops_batch(tmp_path, runtime):
+    src=tmp_path/'project'
+    part(src,'a.SLDPRT'); part(src,'b.SLDPRT',b'b')
+    runtime['export_dxf']=lambda *a,**kw: {'success':False,'preference_restore':False}
+    result=cli.convert_project(options(tmp_path,src),runtime=runtime)
+    assert len(result['results'])==1
+    assert result['results'][0]['error_code']=='SW_EXPORT_PREFERENCE_RESTORE_FAILED'
+    assert len(result['not_converted'])==1
+
+
+def test_layout_retry_selects_improvement_and_preserves_failed_candidate(tmp_path, monkeypatch):
+    from copy import deepcopy
+    dimensions=[{'identity':{'source':'p','configuration':'Default','canonical_key':'p|Default|D1'},
+                 'system_value':{'value':.02,'unit':'m','type':2},'visibility':'visible'}]
+    calls=[]
+    def attempt(session,source,configuration,spec,template,root,stem,runtime):
+        calls.append(deepcopy(spec)); root.mkdir(exist_ok=True)
+        collision=[] if len(calls)==2 else [{'first':'D1','second':'D2'}]
+        return {'save':True,'export':True,'outputs':{'pdf':str(root/'part.pdf')},
+                'generation':{'layout':{'scale':spec.get('scale',5)}},'structure':{'dimensions':deepcopy(dimensions)},
+                'review':{'pdf_dimension_rendering':{'collisions':collision,'matched':[{'dimension_index':0}]}},'spec':deepcopy(spec)}
+    monkeypatch.setattr(cli,'_drawing_attempt',attempt)
+    result=cli._drawing_with_layout_retries(None,None,None,{'paperSize':'A3'},None,tmp_path/'out','part',{},3)
+    assert len(calls)==2 and result['selected_layout_attempt']==2
+    assert result['layout_attempts'][1]['accepted'] is True
+    assert 'layout_attempt_02' in result['outputs']['pdf']
+    final=json.loads((tmp_path/'out'/'drawing_structure_ai.json').read_text())
+    assert final['dimensions']==dimensions
+    generation=json.loads((tmp_path/'out'/'generation_ai.json').read_text())
+    assert generation['layout']['scale']==2.0

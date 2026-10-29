@@ -17,5 +17,8 @@
 - 标题栏模板候选不等于字段内容已验证；无法回读时保持 `review_required`。
 - DrawingSpec 请求的标准、轴测、剖视和局部视图都必须在结构证据中逐项出现。
 - 专业标注必须来自 `IView` 的中心标记、中心线、基准、GTOL、表面粗糙度或焊接符号实体，孔标注必须来自 `IDisplayDimension.IsHoleCallout`；不能用相同文字的普通注释替代。
+- PDF 尺寸数字按显示精度匹配；缺少完整期望文本的复合孔/螺纹标注不能只凭首个数字通过。多个候选、多个尺寸争用同一文字、角度缺少 `°` 或未知类型缺少语义时保持 `review_required`。
+- 估算尺寸框只用于风险筛查，不作为真实拥挤证据；布局修复只能接受最多 3 次有界尝试中经真实 PDF 指标改善且尺寸身份、数值、可见性完全不变的结果。
+- DXF 复核必须确认原生保存成功、文件是本轮新鲜产物且实体计数合理，并分别统计/检查顶层与块内标注；临时 `swDxfExportViewAsBlock` 偏好必须恢复。FreeCAD 内置 C++ DXF importer 的实际导入未执行时保持 `not_tested`，DXF/STEP 仅作几何交换，不提供参数关联恢复。
 - 注解型中心标记优先通过 `IView.GetFirstCenterMark2` 与 `ICenterMark.GetNext` 遍历；`GetCenterMarks` 只作为旧版本回退，不能单独覆盖全部中心标记类型。
 - `professionalAnnotations` 按视图、类型、数量和文字逐项匹配。基准标签精确匹配，`A` 不得命中 `AB`。

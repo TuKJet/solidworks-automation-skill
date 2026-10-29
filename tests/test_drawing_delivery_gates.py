@@ -29,6 +29,104 @@ def test_nearby_wrong_number_is_not_dimension_evidence(tmp_path):
     assert result['status'] != 'pass'
 
 
+def test_dimension_position_without_text_or_value_is_not_evidence(tmp_path):
+    import fitz
+    pdf = tmp_path / 'position-only.pdf'
+    with fitz.open() as doc:
+        page = doc.new_page(width=300, height=200)
+        page.insert_text((100, 100), '12')
+        doc.save(pdf)
+    result = sw_drawing_review.inspect_pdf_dimension_rendering(pdf, {
+        'sheet_size': {'width_m': .3, 'height_m': .2},
+        'dimensions': [{'name': 'D1', 'box_evidence': {'position_m': [.105, .105]}}],
+    })
+    assert result['status'] == 'review_required'
+    assert result['unmatched_dimension_indexes'] == [0]
+
+
+def test_dimension_numeric_match_uses_display_precision(tmp_path):
+    import fitz
+    pdf = tmp_path / 'display-precision.pdf'
+    with fitz.open() as doc:
+        page = doc.new_page(width=300, height=200)
+        page.insert_text((100, 100), '0.03')
+        doc.save(pdf)
+    wrong = sw_drawing_review.inspect_pdf_dimension_rendering(pdf, {
+        'sheet_size': {'width_m': .3, 'height_m': .2},
+        'dimensions': [{'name': 'D1', 'value_mm': .02,
+                        'box_evidence': {'position_m': [.105, .105]}}],
+    })
+    rounded = sw_drawing_review.inspect_pdf_dimension_rendering(pdf, {
+        'sheet_size': {'width_m': .3, 'height_m': .2},
+        'dimensions': [{'name': 'D1', 'value_mm': .025,
+                        'box_evidence': {'position_m': [.105, .105]}}],
+    })
+    assert wrong['status'] == 'review_required'
+    assert rounded['status'] == 'pass'
+
+
+def test_composite_numeric_annotation_requires_complete_text_evidence(tmp_path):
+    import fitz
+    pdf = tmp_path / 'composite-number.pdf'
+    with fitz.open() as doc:
+        page = doc.new_page(width=300, height=200)
+        page.insert_text((100, 100), 'M1.2X0.30')
+        doc.save(pdf)
+    result = sw_drawing_review.inspect_pdf_dimension_rendering(pdf, {
+        'sheet_size': {'width_m': .3, 'height_m': .2},
+        'dimensions': [{'name': 'T1', 'value_mm': 1.2,
+                        'box_evidence': {'position_m': [.105, .105]}}],
+    })
+    assert result['status'] == 'review_required'
+
+
+def test_angle_requires_degree_marker_without_complete_native_text(tmp_path):
+    import fitz
+    plain = tmp_path / 'angle-plain.pdf'
+    with fitz.open() as doc:
+        page = doc.new_page(width=300, height=200)
+        page.insert_text((100, 100), '45')
+        doc.save(plain)
+    missing_marker = sw_drawing_review.inspect_pdf_dimension_rendering(plain, {
+        'sheet_size': {'width_m': .3, 'height_m': .2},
+        'dimensions': [{'name': 'A1', 'type2': 3,
+                        'system_value': {'value_degrees': 45.0},
+                        'box_evidence': {'position_m': [.105, .105]}}],
+    })
+    assert missing_marker['status'] == 'review_required'
+
+    marked = tmp_path / 'angle-marked.pdf'
+    with fitz.open() as doc:
+        page = doc.new_page(width=300, height=200)
+        page.insert_text((100, 100), '45°')
+        doc.save(marked)
+    valid = sw_drawing_review.inspect_pdf_dimension_rendering(marked, {
+        'sheet_size': {'width_m': .3, 'height_m': .2},
+        'dimensions': [{'name': 'A1', 'type2': 3,
+                        'text': '45°',
+                        'system_value': {'value_degrees': 45.0},
+                        'box_evidence': {'position_m': [.105, .105]}}],
+    })
+    assert valid['status'] == 'pass'
+
+
+def test_nearby_same_value_candidates_remain_ambiguous(tmp_path):
+    import fitz
+    pdf = tmp_path / 'ambiguous-value.pdf'
+    with fitz.open() as doc:
+        page = doc.new_page(width=300, height=200)
+        page.insert_text((98, 100), '12')
+        page.insert_text((102, 108), '12', fontname='cour')
+        doc.save(pdf)
+    result = sw_drawing_review.inspect_pdf_dimension_rendering(pdf, {
+        'sheet_size': {'width_m': .3, 'height_m': .2},
+        'dimensions': [{'name': 'D1', 'value_mm': 12,
+                        'box_evidence': {'position_m': [.1, .1]}}],
+    })
+    assert result['status'] == 'review_required'
+    assert result['ambiguous_dimension_indexes'] == [0]
+
+
 def test_multiline_note_matches_pdf_lines_and_crlf(tmp_path):
     import fitz
     pdf = tmp_path / 'sheet.pdf'

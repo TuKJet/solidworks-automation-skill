@@ -112,6 +112,44 @@ def _dimension_number(dimension: Mapping[str, Any], field: str) -> float | None:
     return number if math.isfinite(number) else None
 
 
+_DISPLAY_NUMBER_RE = re.compile(r"[-+]?\d+(?:[.,]\d+)?")
+
+
+def _display_number_matches(expected: float, text: Any) -> bool:
+    """Match a value at the precision actually printed in the PDF.
+
+    This accepts ordinary drawing rounding (for example 0.025 rendered as
+    0.03), while rejecting a different value such as 0.02 rendered as 0.03.
+    It deliberately does not infer units or dimension meaning from arbitrary
+    text; callers provide the semantic expectation separately.
+    """
+    matches = list(_DISPLAY_NUMBER_RE.finditer(str(text or "")))
+    if len(matches) != 1:
+        return False
+    match = matches[0]
+    token = match.group(0).replace(",", ".")
+    try:
+        actual = float(token)
+        decimals = len(token.split(".", 1)[1]) if "." in token else 0
+    except ValueError:
+        return False
+    return round(actual, decimals) == round(float(expected), decimals)
+
+
+def _display_semantics_match(dimension: Mapping[str, Any], text: Any) -> bool:
+    """Keep explicit diameter/radius/angle markers tied to their meaning."""
+    kind = _dimension_kind(dimension) or ""
+    kind = str(kind).casefold()
+    rendered = str(text or "")
+    if kind in {"diameter", "diametric"} and not any(mark in rendered for mark in ("Ø", "⌀")):
+        return False
+    if kind in {"radius", "radial"} and not re.search(r"(?:^|\s)R", rendered, re.IGNORECASE):
+        return False
+    if kind in {"angular", "angle"} and "°" not in rendered:
+        return False
+    return True
+
+
 def _dimension_kind(dimension: Mapping[str, Any]) -> str | None:
     explicit = dimension.get("kind") or dimension.get("semantic_kind")
     if explicit:
@@ -695,6 +733,7 @@ def inspect_pdf_dimension_rendering(
         "source": "solidworks_pdf_vector_text",
         "matched": [],
         "unmatched_dimension_indexes": [],
+        "ambiguous_dimension_indexes": [],
         "collisions": [],
         "error_code": None,
         "manual_review_required": True,
@@ -722,7 +761,7 @@ def inspect_pdf_dimension_rendering(
         return base
 
     sheet_order = {str(name): index for index, name in enumerate(structure.get("sheets") or [])}
-    used = set()
+    candidate_sets = {}
     for index, dimension in enumerate(dimensions):
         if _hidden(dimension):
             continue
@@ -748,19 +787,27 @@ def inspect_pdf_dimension_rendering(
             base["unmatched_dimension_indexes"].append(index)
             continue
         tolerance_pt = tolerance_m / min(width_m / page_width, height_m / page_height)
+        expected_text = str(dimension.get("text") or "").strip()
+        expected_value = _dimension_number(dimension, "value_degrees")
+        if expected_value is None:
+            expected_value = _dimension_number(dimension, "value_mm")
+        # Position alone is not semantic evidence: without either the exact
+        # display text or a structured numeric value, any nearby annotation
+        # would be an unverifiable match.
+        if not expected_text and expected_value is None:
+            base["unmatched_dimension_indexes"].append(index)
+            continue
         candidates = []
         for candidate_index, span in enumerate(page.get("textSpans") or []):
-            if (page_index, candidate_index) in used or not span.get("dimensionCandidate"):
+            # A complete native text requirement may contain symbols (for
+            # example 45°) that the generic numeric classifier excludes.
+            if not span.get("dimensionCandidate") and not expected_text:
                 continue
-            expected_text = str(dimension.get("text") or "").strip()
-            expected_value = _dimension_number(dimension, "value_degrees")
-            if expected_value is None:
-                expected_value = _dimension_number(dimension, "value_mm")
             if expected_text and _normalise_token(expected_text) != _normalise_token(span.get("text")):
                 continue
             if expected_value is not None:
-                numbers = _extract_numbers(span.get("text"))
-                if not numbers or not math.isclose(numbers[0], float(expected_value), abs_tol=0.01, rel_tol=0):
+                if (not _display_number_matches(float(expected_value), span.get("text"))
+                        or (not expected_text and not _display_semantics_match(dimension, span.get("text")))):
                     continue
             left, top, right, bottom = (float(value) for value in span["bboxPt"])
             center_x = (left + right) / 2.0
@@ -771,8 +818,27 @@ def inspect_pdf_dimension_rendering(
         if not candidates:
             base["unmatched_dimension_indexes"].append(index)
             continue
-        _, candidate_index, span = min(candidates, key=lambda item: item[0])
-        used.add((page_index, candidate_index))
+        candidate_sets[index] = (page_index, candidates)
+
+    # Do not greedily assign the nearest span.  A same-value pair of nearby
+    # annotations, or two dimensions competing for one span, is ambiguous and
+    # must remain review-required rather than being silently cross-assigned.
+    span_claims = {}
+    for index, (page_index, candidates) in candidate_sets.items():
+        if len(candidates) != 1:
+            base["ambiguous_dimension_indexes"].append(index)
+            continue
+        span_claims.setdefault((page_index, candidates[0][1]), []).append(index)
+    for claim, indexes in span_claims.items():
+        if len(indexes) > 1:
+            base["ambiguous_dimension_indexes"].extend(indexes)
+    for index, (page_index, candidates) in candidate_sets.items():
+        if index in base["ambiguous_dimension_indexes"]:
+            continue
+        _, candidate_index, span = candidates[0]
+        page = pages[page_index]
+        page_width = float(page["widthPt"])
+        page_height = float(page["heightPt"])
         left, top, right, bottom = (float(value) for value in span["bboxPt"])
         base["matched"].append({
             "dimension_index": index,
@@ -786,7 +852,7 @@ def inspect_pdf_dimension_rendering(
                 "right": right / page_width * width_m,
                 "top": (page_height - top) / page_height * height_m,
             },
-            "distance_to_com_position_pt": round(min(candidates, key=lambda item: item[0])[0], 6),
+            "distance_to_com_position_pt": round(candidates[0][0], 6),
         })
     for current_index, current in enumerate(base["matched"]):
         for other in base["matched"][current_index + 1:]:
@@ -795,7 +861,7 @@ def inspect_pdf_dimension_rendering(
                 {"left": other["bbox_pt"][0], "top": other["bbox_pt"][1], "right": other["bbox_pt"][2], "bottom": other["bbox_pt"][3]},
             ):
                 base["collisions"].append({"first": current["dimension_name"], "second": other["dimension_name"], "code": "DRAWING_RENDERED_DIMENSION_TEXT_OVERLAP"})
-    if base["unmatched_dimension_indexes"]:
+    if base["unmatched_dimension_indexes"] or base["ambiguous_dimension_indexes"]:
         base.update({"status": "review_required", "error_code": "DRAWING_PDF_DIMENSION_MATCH_INCOMPLETE", "pdf": pdf})
     elif base["collisions"]:
         base.update({"status": "review_required", "error_code": "DRAWING_RENDERED_DIMENSION_TEXT_OVERLAP", "pdf": pdf})
