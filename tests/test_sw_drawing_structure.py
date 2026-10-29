@@ -220,6 +220,34 @@ def test_inspect_drawing_structure_reports_views_dimensions_and_template():
     assert result["dimension_box_count"] == 1
 
 
+def test_hole_callout_variables_are_guarded_by_native_hole_flag():
+    class Ordinary:
+        def IsHoleCallout(self):
+            return False
+
+        def GetHoleCalloutVariables(self):
+            raise AssertionError("ordinary dimensions must not call GetHoleCalloutVariables")
+
+    class Hole:
+        def IsHoleCallout(self):
+            return True
+
+        def GetHoleCalloutVariables(self):
+            return ["DIAMETER=8"]
+
+    class Unknown:
+        def IsHoleCallout(self):
+            return None
+
+        def GetHoleCalloutVariables(self):
+            raise AssertionError("unknown flag must not guess hole-callout state")
+
+    module = sw_drawing._MODULE
+    assert module._hole_callout_state(Ordinary()) == (False, [])
+    assert module._hole_callout_state(Hole()) == (True, ["DIAMETER=8"])
+    assert module._hole_callout_state(Unknown()) == (None, None)
+
+
 def test_inspect_dimensions_keeps_identity_not_value_deduplicated_and_marks_visibility():
     """@brief 两个相同数值尺寸仍须以 source/config/model identity 分开审查。"""
     class ModelDimension:

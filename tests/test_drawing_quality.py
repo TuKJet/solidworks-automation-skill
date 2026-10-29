@@ -17,7 +17,7 @@ def test_candidates_respect_explicit_scale_limit_and_user_spacing():
     assert layout_candidate_specs({'scale': .5}, 1) == []
     assert layout_candidate_specs({}, 1, max_attempts=1) == []
     got = layout_candidate_specs({'layoutOptions': {'viewGapMm': 60, 'marginMm': 30}}, 1)
-    assert [x['scale'] for x in got] == [.5, .2]
+    assert [x['scale'] for x in got] == [1, .5]
     assert all(x['layoutOptions'] == {'viewGapMm':60, 'marginMm':30} for x in got)
 
 

@@ -11,7 +11,7 @@ STANDARD_DRAWING_SCALES = (10.0, 5.0, 2.0, 1.0, 0.5, 0.2, 0.1, 0.05, 0.02, 0.01)
 
 
 def layout_candidate_specs(base_spec: Mapping[str, Any], observed_scale: float | None, max_attempts: int = 3) -> list[dict[str, Any]]:
-    """Return at most two smaller-scale, more spacious redraw specs.
+    """Widen view spacing first; shrink at most one standard scale step.
 
     An explicit user scale is authoritative and yields no candidates.
     """
@@ -26,7 +26,7 @@ def layout_candidate_specs(base_spec: Mapping[str, Any], observed_scale: float |
     limit = max(0, min(int(max_attempts) - 1, 2))
     smaller = [s for s in STANDARD_DRAWING_SCALES if s < scale - 1e-12]
     candidates = []
-    for index, candidate_scale in enumerate(smaller[:limit]):
+    for index, candidate_scale in enumerate(([scale] + smaller[:1])[:limit]):
         item = copy.deepcopy(dict(base_spec))
         item["scale"] = candidate_scale
         old = item.get("layoutOptions") or {}

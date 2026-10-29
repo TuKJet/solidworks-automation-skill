@@ -20,9 +20,17 @@ if str(REPO_ROOT) not in sys.path:
 from scripts.artifact_ledger import RunLedger, sha256_file
 from scripts.sw_project_inventory import inventory_project
 from scripts.drawing_spec import validate_drawing_spec
+from scripts.annotation_acceptance import evaluate_annotation_acceptance
 
 SKILL_NAME = "solidworks-3d-2d"
 MODEL_TYPES = {".sldprt": (1, "part"), ".sldasm": (2, "assembly")}
+
+
+def implementation_fingerprint():
+    """Identify the exact installed implementation used by a native run."""
+    paths = sorted(list((REPO_ROOT / "scripts").rglob("*.py")) +
+                   list((REPO_ROOT / "subskills").rglob("*.py")))
+    return {path.relative_to(REPO_ROOT).as_posix(): sha256_file(path) for path in paths}
 
 
 class ConversionBlocked(RuntimeError):
@@ -145,11 +153,13 @@ def _load_runtime():
     from scripts.sw_session import SolidWorksSession
     from scripts.sw_export import export_drawing_to_dxf_detailed
     from scripts.dxf_validation import validate_dxf_file
+    from scripts.drawing_geometry_annotations import repair_generated_annotations
     return {"workflow": workflow, "review_drawing_artifacts": review.review_drawing_artifacts,
             "delivery_verdict": review.delivery_verdict, "get_com_member": get_com_member,
             "activate_configuration": activate_configuration, "exclusive_cad_job": exclusive_cad_job,
             "SolidWorksSession": SolidWorksSession, "export_dxf": export_drawing_to_dxf_detailed,
-            "validate_dxf": validate_dxf_file}
+            "validate_dxf": validate_dxf_file, "implementation_fingerprint": implementation_fingerprint(),
+            "repair_annotations": lambda drawing, sw_app: repair_generated_annotations(drawing, sw_app, workflow._MODULE)}
 
 
 def _configuration(model, get):
@@ -239,6 +249,9 @@ def _drawing_attempt(session, source, configuration, spec, template, root, stem,
         if generated.get("status") not in {"pass", "review_required"}:
             raise ConversionBlocked(generated.get("error_code") or "DRAWING_GENERATION_FAILED", json.dumps(generated, ensure_ascii=False))
         views = _view_configuration_evidence(drawing, source, configuration, get)
+        annotation_repair = runtime["repair_annotations"](drawing, session.sw) if spec.get("insertModelDimensions", True) else {"status": "not_requested"}
+        generated["annotation_repair"] = annotation_repair
+        _json_write(root / "generation_ai.json", generated)
         save_ok = bool(session.save(drawing, str(drawing_path)))
         export_ok = save_ok and bool(workflow.export_sheet_to_pdf(drawing, str(pdf_path), sw_app=session.sw))
         structure = workflow.inspect_drawing_structure(drawing, paper_size_hint=spec["paperSize"], title_block_box=(generated.get("layout") or {}).get("title_block_box"))
@@ -257,9 +270,13 @@ def _drawing_attempt(session, source, configuration, spec, template, root, stem,
                 dxf["status"] = dxf["validation"]["status"]
             _json_write(root / "dxf_review_ai.json", dxf)
         review = runtime["review_drawing_artifacts"](spec, structure=structure, pdf_path=pdf_path if export_ok else None)
+        acceptance = evaluate_annotation_acceptance(spec, structure, annotation_repair, review)
+        if acceptance["status"] == "blocked":
+            review.setdefault("findings", []).extend({**issue, "severity": "fail"} for issue in acceptance["issues"])
+            review["status"] = "blocked"
         verdict = runtime["delivery_verdict"](save_ok=save_ok, export_ok=export_ok, review=review, manufacturing={"status": "unknown"})
-        status = "blocked" if dxf["status"] == "blocked" else verdict["status"]
-        return {"generation": generated, "view_configurations": views,
+        status = "blocked" if dxf["status"] == "blocked" or annotation_repair["status"] == "blocked" else verdict["status"]
+        return {"generation": generated, "view_configurations": views, "annotation_acceptance": acceptance,
                 "status": status, "save": save_ok, "export": export_ok, "review": review, "delivery": verdict, "dxf": dxf,
                 "outputs": {"slddrw": str(drawing_path) if save_ok else None, "pdf": str(pdf_path) if export_ok else None,
                             "dxf": str(dxf_path) if dxf["status"] in {"pass", "review_required"} else None},
@@ -293,6 +310,8 @@ def _drawing_with_layout_retries(session, source, configuration, spec, template,
                 history.append({"attempt": index, "accepted": False, "error_code": code, "error": str(error)})
                 if code in {"SW_COM_CONNECTION_LOST", "SW_HOST_BUSY", "SW_DOCUMENT_CLEANUP_FAILED", "SW_EXPORT_PREFERENCE_RESTORE_FAILED"}:
                     raise
+                if code in {"DRAWING_SCALE_DOES_NOT_FIT", "DRAWING_LAYOUT_BLOCKED", "DRAWING_GENERATION_FAILED"}:
+                    continue
                 break
     best["layout_attempts"] = history
     best["selected_layout_attempt"] = next(item["attempt"] for item in reversed(history) if item.get("accepted"))
@@ -325,6 +344,7 @@ def convert_one(source, options, *, runtime=None):
         if spec.get("bom"):
             dependencies.append(Path(spec["bom"]["templatePath"]))
         runtime = runtime or _load_runtime()
+        result["implementation_fingerprint"] = runtime.get("implementation_fingerprint")
         workflow, get = runtime["workflow"], runtime["get_com_member"]
         capability = workflow.validate_generic_drawing_generation(spec)
         if capability.get("status") != "pass":

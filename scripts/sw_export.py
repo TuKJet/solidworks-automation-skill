@@ -54,6 +54,12 @@ def _resolve_sw_constant(name, sw_app=None):
         if value is not None:
             _SW_CONSTANT_CACHE[name] = value
             return value
+    # EnsureModule can register enum constants on win32com.client.constants
+    # without exposing them directly on its returned module (first COM call).
+    value = getattr(constants, name, None) if constants is not None else None
+    if value is not None:
+        _SW_CONSTANT_CACHE[name] = value
+        return value
     return None
 
 

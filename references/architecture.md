@@ -1,6 +1,14 @@
 # 提取范围与验证
 
-2026-10-29 原生回归（SolidWorks 2025 / Python 3.12）：24 个零件版本均保存 SLDDRW、PDF、DXF；21 件有可导入模型尺寸，共 420 个，DXF 顶层 DIMENSION 数逐件一致。10 件选用了更好的布局，PDF 文字重叠总数从 32 降至 3；2 件仍未通过可读性门禁，另 3 件无模型尺寸。STEP 导出覆盖 24 个零件、8 个装配体，另 1 个装配体在批次及独立只读重试中均报告 dirty，保持阻断。721 个源文件本轮哈希未变。FreeCAD 实际导入未执行。回归测试 280 passed、2 skipped；独立包不含的两项 MCP 服务测试显式排除。
+2026-10-29 标注反馈修复：原始后端盖曾显示 37 个尺寸，但只有 19 个唯一模型尺寸；原始铁芯只有两处相同长度，缺内外径。新增 `drawing_annotation_policy.py` 做保守的模型身份/语义去重，`drawing_geometry_annotations.py` 在本轮拥有的新图纸中隐藏重复显示，并从正投影完整圆边补关联直径。真实铁芯圆边读取为外径 11.2 mm、内径 9 mm，原生补标读回与 PDF 试验已验证。此前的“文字重叠减少”数据不能当作整图可读或制造标注完整的结论。
+
+新增补标只覆盖单页零件图中的缺失直径数值，不证明孔数量、孔位、深度、公差或每个同径实体的关联完整；遇到同值既有直径报告 attachment_unverified，始终保留工程复核。圆弧、斜投影椭圆、多页图纸和装配体不会被当作已验证圆径覆盖。原生 `AddDiameterDimension2` 的输出在排列后再次核对身份、类型、数值、可见性。矩阵投影按 [SOLIDWORKS IMathTransform 官方定义](https://help.solidworks.com/2023/english/api/sldworksapi/SOLIDWORKS.Interop.sldworks~SOLIDWORKS.Interop.sldworks.IMathTransform.html) 计算，避免部分 COM 环境的 MathUtility 调用异常。
+
+反馈样例最终原生回归：铁芯只显示长度 17、内径 9、外径 11.2；后端盖隐藏 18 个重复显示，并补充实际圆边直径 3.1，共 20 个可见尺寸。等价直径分担到侧视图，跨视图近邻尺寸移至外侧，`SetPosition2` 后逐项核对原生坐标，未写源尺寸。两张最终 PDF 已渲染复核，SLDDRW/PDF/DXF 均成功，源哈希未变。代码指纹记录在原生报告中；本版适用测试 309 passed、2 skipped、2 个完整 MCP 专用测试排除。
+
+另修正 SW 2025 的未定义接口调用：仅在 `IsHoleCallout=True` 时读取 `GetHoleCalloutVariables`，普通尺寸返回空变量集，未知状态继续保守保留。新增 `annotation_acceptance` 把零尺寸、遗漏圆径、未处理重复、圆审计错误和确认拥挤明确阻断。PDF 数字框没有重叠仍不能证明符号/引线可读，原生小样视觉复核是扩批前置步骤。
+
+反馈前的 2026-10-29 批次（历史证据，不能代表本次标注修复）：24 个零件版本均保存 SLDDRW、PDF、DXF；21 件有可导入模型尺寸，共 420 个，DXF 顶层 DIMENSION 数逐件一致。10 件选用了重叠指标改善的布局，PDF 文字重叠总数从 32 降至 3；2 件仍未通过可读性门禁，另 3 件无模型尺寸。STEP 导出覆盖 24 个零件、8 个装配体，另 1 个装配体在批次及独立只读重试中均报告 dirty，保持阻断。721 个源文件该轮哈希未变。FreeCAD 实际导入未执行。回归测试 280 passed、2 skipped；独立包不含的两项 MCP 服务测试显式排除。
 
 从 `vm-sw-automation-skill` 的 `8a572ce` 提取，独立分支为 `vm-sw-3d-2d`，对外 Skill 名为 `solidworks-3d-2d`。
 

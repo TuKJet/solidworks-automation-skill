@@ -2137,6 +2137,18 @@ def _dimension_system_value(display_dimension, model_dimension):
     }
 
 
+def _hole_callout_state(dimension):
+    """Read hole-callout variables only when the native flag permits it."""
+    raw = _safe_member(dimension, "IsHoleCallout", default=None)
+    if raw is None:
+        return None, None
+    is_hole_callout = bool(raw)
+    if not is_hole_callout:
+        return False, []
+    variables = _safe_member(dimension, "GetHoleCalloutVariables", default=None)
+    return True, None if variables is None else _as_sequence(variables)
+
+
 def _view_projection_relationships(sheet_views):
     """Derive a projected view's movable axis only from its actual base relation.
 
@@ -2234,6 +2246,7 @@ def inspect_drawing_structure(drawing_model, *, paper_size_hint=None, title_bloc
                 system_value = _dimension_system_value(dimension, model_dimension)
                 native_box = _annotation_box(dimension)
                 estimated_box_evidence = estimate_dimension_text_box(dimension) if native_box is None else None
+                is_hole_callout, hole_callout_variables = _hole_callout_state(dimension)
                 dimension_record = {
                     "sheet": str(sheet_name),
                     "view": _safe_member(view, "Name", default=""),
@@ -2260,8 +2273,8 @@ def inspect_drawing_structure(drawing_model, *, paper_size_hint=None, title_bloc
                         "confidence": "high",
                         "method": "annotation_get_box",
                     } if native_box else estimated_box_evidence,
-                    "is_hole_callout": bool(_safe_member(dimension, "IsHoleCallout", default=False)),
-                    "hole_callout_variables": _as_sequence(_safe_member(dimension, "GetHoleCalloutVariables", default=[])),
+                    "is_hole_callout": is_hole_callout,
+                    "hole_callout_variables": hole_callout_variables,
                 }
                 dimensions.append(dimension_record)
                 if dimension_record["is_hole_callout"]:
@@ -2348,6 +2361,8 @@ def inspect_drawing_structure(drawing_model, *, paper_size_hint=None, title_bloc
         },
         "view_count": len(views),
         "dimension_count": len(dimensions),
+        "visible_dimension_count": sum(d["visibility"] == "visible" for d in dimensions),
+        "hidden_dimension_count": sum(d["visibility"] == "hidden" for d in dimensions),
         "stored_dimension_count": stored_dimension_count,
         "table_count": len(tables),
         "view_outline_count": outline_count,

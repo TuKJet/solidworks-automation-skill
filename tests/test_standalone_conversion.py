@@ -131,11 +131,15 @@ def runtime():
 
     workflow = SimpleNamespace(validate_generic_drawing_generation=validate_generic_drawing_generation,
                                generate_drawing_from_spec=generate, export_sheet_to_pdf=export,
-                               inspect_drawing_structure=lambda drawing, **kwargs: {"views": [], "dimensions": []})
+                               inspect_drawing_structure=lambda drawing, **kwargs: {
+                                   "views": [], "dimensions": [{"visibility": "visible", "visible": True,
+                                                                  "type2": 2, "system_value": {"type": 2, "unit": "m", "value": 0.025}}]
+                               })
     return {"SolidWorksSession": Session, "exclusive_cad_job": nullcontext, "get_com_member": member,
             "activate_configuration": activate, "workflow": workflow, "delivery_verdict": delivery_verdict,
             "review_drawing_artifacts": lambda spec, **kwargs: {"status": "review_required"}, "state": state,
-            "export_dxf": export_dxf, "validate_dxf": lambda *args, **kwargs: {"status": "review_required"}}
+            "export_dxf": export_dxf, "validate_dxf": lambda *args, **kwargs: {"status": "review_required"},
+            "repair_annotations": lambda *args, **kwargs: {"status": "pass", "geometry": {"circles": [], "errors": []}}}
 
 
 def options(tmp_path, source=None, **overrides):
@@ -196,6 +200,28 @@ def test_configuration_roundtrip_and_native_context(tmp_path, runtime):
     assert result["outputs"]["pdf"]
     ledger = json.loads((opts_root := Path(result["report"]).parent / "drawing.run-ledger.json").read_text())
     assert len(ledger["artifacts"]) >= 5
+
+
+def test_cli_gate_blocks_when_model_dimensions_are_absent(tmp_path, runtime, monkeypatch):
+    src = part(tmp_path)
+    runtime["workflow"].inspect_drawing_structure = lambda drawing, **kwargs: {"views": [], "dimensions": []}
+    monkeypatch.setattr(cli, "_load_runtime", lambda: runtime)
+    result = cli.convert_one(src, options(tmp_path, src), runtime=runtime)
+    assert result["status"] == "blocked"
+    assert result["annotation_acceptance"]["status"] == "blocked"
+    assert any(item["code"] == "DRAWING_MODEL_DIMENSIONS_MISSING" for item in result["annotation_acceptance"]["issues"])
+
+
+def test_cli_gate_blocks_missing_diameter_repair_evidence(tmp_path, runtime):
+    src = part(tmp_path)
+    runtime["repair_annotations"] = lambda *args, **kwargs: {
+        "status": "blocked", "missing_diameters": [{"diameter_mm": 11.2}],
+        "geometry": {"circles": [], "errors": []},
+    }
+    result = cli.convert_one(src, options(tmp_path, src), runtime=runtime)
+    assert result["status"] == "blocked"
+    assert result["annotation_acceptance"]["status"] == "blocked"
+    assert any(item["code"] == "DRAWING_CIRCULAR_DIAMETERS_MISSING" for item in result["annotation_acceptance"]["issues"])
 
 
 def test_failed_pdf_is_evidence_never_a_published_output(tmp_path, runtime):
@@ -399,4 +425,4 @@ def test_layout_retry_selects_improvement_and_preserves_failed_candidate(tmp_pat
     final=json.loads((tmp_path/'out'/'drawing_structure_ai.json').read_text())
     assert final['dimensions']==dimensions
     generation=json.loads((tmp_path/'out'/'generation_ai.json').read_text())
-    assert generation['layout']['scale']==2.0
+    assert generation['layout']['scale']==5.0
