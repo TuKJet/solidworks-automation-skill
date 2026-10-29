@@ -842,7 +842,7 @@ def inspect_pdf_dimension_rendering(
         left, top, right, bottom = (float(value) for value in span["bboxPt"])
         base["matched"].append({
             "dimension_index": index,
-            "dimension_name": str(dimension.get("name") or ""),
+            "dimension_name": str(dimensions[index].get("name") or ""),
             "page": page_index + 1,
             "text": span["text"],
             "bbox_pt": [left, top, right, bottom],

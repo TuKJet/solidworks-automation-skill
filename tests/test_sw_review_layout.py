@@ -1,6 +1,7 @@
 """Regression tests for bounded, evidence-aware drawing layout repair plans."""
 
 from scripts.sw_review import build_layout_repair_plan
+import pytest
 
 
 def _structure(*, estimated=False):
@@ -78,6 +79,42 @@ def test_sheet_boundary_includes_notes_and_dimensions():
     structure = _structure()
     structure['notes'] = [{'text': 'lost', 'box': {'left': .4, 'right': .45, 'bottom': .1, 'top': .12}}]
     assert any(f['code'] == 'DRAWING_OUTSIDE_SHEET' for f in review_drawing_layout(structure)['findings'])
+
+
+@pytest.mark.parametrize('evidence_source', ['estimated', 'unavailable'])
+def test_estimated_sheet_boundary_is_warning_not_blocking_failure(evidence_source):
+    from scripts.sw_review import review_drawing_layout
+
+    structure = _structure()
+    structure['dimensions'][0].update({
+        'box': {'left': 0.12, 'bottom': 0.15, 'right': 0.45, 'top': 0.17},
+        'box_source': evidence_source,
+        'box_confidence': 'low',
+    })
+    finding = next(f for f in review_drawing_layout(structure)['findings']
+                   if f['code'] == 'DRAWING_OUTSIDE_SHEET')
+    assert finding['severity'] == 'warning'
+    assert finding['evidence_source'] == evidence_source
+    assert finding['confidence'] == 'low'
+    assert finding['confirmed_collision'] is False
+
+
+def test_pdf_vector_sheet_boundary_remains_fail_with_its_confidence():
+    from scripts.sw_review import review_drawing_layout
+
+    structure = _structure()
+    structure['dimensions'][0].update({
+        'box': {'left': 0.12, 'bottom': 0.15, 'right': 0.45, 'top': 0.17},
+        'box_source': 'pdf_vector_text',
+        'box_confidence': 'medium',
+    })
+    finding = next(f for f in review_drawing_layout(structure)['findings']
+                   if f['code'] == 'DRAWING_OUTSIDE_SHEET')
+    assert finding['severity'] == 'fail'
+    assert finding['evidence_source'] == 'pdf_vector_text'
+    assert finding['confidence'] == 'medium'
+    # PDF evidence is a rendered risk/failure but not a native COM collision.
+    assert finding['confirmed_collision'] is False
 
 
 def _native_repair_structure(*, overlap):

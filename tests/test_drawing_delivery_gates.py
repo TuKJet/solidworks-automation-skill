@@ -2,6 +2,30 @@
 from scripts import sw_drawing_review
 
 
+def test_pdf_dimension_matches_keep_each_original_annotation_name(tmp_path):
+    import fitz
+    pdf = tmp_path / 'distinct-dimensions.pdf'
+    with fitz.open() as doc:
+        page = doc.new_page(width=300, height=200)
+        page.insert_text((80, 100), '12')
+        page.insert_text((180, 100), '15')
+        doc.save(pdf)
+    result = sw_drawing_review.inspect_pdf_dimension_rendering(pdf, {
+        'sheet_size': {'width_m': .3, 'height_m': .2},
+        'dimensions': [
+            {'name': 'length-12', 'value_mm': 12,
+             'box_evidence': {'position_m': [.085, .105]}},
+            {'name': 'length-15', 'value_mm': 15,
+             'box_evidence': {'position_m': [.185, .105]}},
+            {'name': 'unmatched-tail', 'value_mm': 99,
+             'box_evidence': {'position_m': [.25, .05]}},
+        ],
+    })
+    assert [(m['dimension_index'], m['dimension_name']) for m in result['matched']] == [
+        (0, 'length-12'), (1, 'length-15')]
+    assert result['unmatched_dimension_indexes'] == [2]
+
+
 def test_hidden_dimension_not_required_in_final_pdf(tmp_path):
     import fitz
     pdf = tmp_path / 'sheet.pdf'

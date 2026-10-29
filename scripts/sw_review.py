@@ -225,8 +225,14 @@ def review_drawing_layout(structure, *, padding_m=0.001, preview_evidence=None) 
             for item in items:
                 box = item.get("box") or {}
                 if box and (box["left"] < 0 or box["bottom"] < 0 or box["right"] > width or box["top"] > height):
-                    add_finding("DRAWING_OUTSIDE_SHEET", "fail", kind, item.get("name") or item.get("text"),
-                                "sheet", item.get("sheet"), evidence_source=item.get("box_source") or "native")
+                    evidence_source = item.get("box_source") or "native"
+                    # Estimated/unavailable envelopes are conservative risk evidence, not
+                    # proof of a rendered boundary violation. Native and PDF vector boxes
+                    # are actionable boundary evidence; preserve the source confidence.
+                    severity = "warning" if evidence_source in {"estimated", "unavailable"} else "fail"
+                    add_finding("DRAWING_OUTSIDE_SHEET", severity, kind, item.get("name") or item.get("text"),
+                                "sheet", item.get("sheet"), evidence_source=evidence_source,
+                                confidence=item.get("box_confidence") or ("low" if severity == "warning" else "high"))
     view_boxes_complete = bool(views) and all(item.get("box") for item in views)
     dimension_boxes_complete = not dimensions or all(item.get("box") for item in dimensions)
     note_boxes_complete = not notes or all(item.get("box") for item in notes)
